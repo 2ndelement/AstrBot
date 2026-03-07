@@ -1,0 +1,493 @@
+import asyncio
+import base64
+import os
+import random
+import uuid
+from typing import cast
+
+import aiofiles
+import botpy
+import botpy.errors
+import botpy.message
+import botpy.types
+import botpy.types.message
+from botpy import Client
+from botpy.http import Route
+from botpy.types import message
+from botpy.types.message import MarkdownPayload, Media
+
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, MessageChain
+from astrbot.api.message_components import Image, Plain, Record
+from astrbot.api.platform import AstrBotMessage, PlatformMetadata
+from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
+from astrbot.core.utils.io import download_image_by_url, file_to_base64
+from astrbot.core.utils.tencent_record_helper import wav_to_tencent_silk
+
+
+def _patch_qq_botpy_formdata() -> None:
+    """Patch qq-botpy for aiohttp>=3.12 compatibility.
+
+    qq-botpy 1.2.1 defines botpy.http._FormData._gen_form_data() and expects
+    aiohttp.FormData to have a private flag named _is_processed, which is no
+    longer present in newer aiohttp versions.
+    """
+
+    try:
+        from botpy.http import _FormData  # type: ignore
+
+        if not hasattr(_FormData, "_is_processed"):
+            setattr(_FormData, "_is_processed", False)
+    except Exception:
+        logger.debug("[QQOfficial] Skip botpy FormData patch.")
+
+
+_patch_qq_botpy_formdata()
+
+
+class QQOfficialMessageEvent(AstrMessageEvent):
+    MARKDOWN_NOT_ALLOWED_ERROR = "不允许发送原生 markdown"
+
+    def __init__(
+        self,
+        message_str: str,
+        message_obj: AstrBotMessage,
+        platform_meta: PlatformMetadata,
+        session_id: str,
+        bot: Client,
+    ) -> None:
+        super().__init__(message_str, message_obj, platform_meta, session_id)
+        self.bot = bot
+        self.send_buffer = None
+
+    async def send(self, message: MessageChain) -> None:
+        self.send_buffer = message
+        await self._post_send()
+
+    async def send_streaming(self, generator, use_fallback: bool = False):
+        """流式输出仅支持消息列表私聊（C2C），其他消息源退化为普通发送"""
+        stream_payload = {"state": 1, "id": None, "index": 0, "reset": False}
+        last_edit_time = 0  # 上次发送分片的时间
+        throttle_interval = 1  # 分片间最短间隔 (秒)
+        ret = None
+        source = self.message_obj.raw_message  # 提前获取，避免 generator 为空时 NameError
+        try:
+            async for chain in generator:
+                source = self.message_obj.raw_message
+
+                if not isinstance(source, botpy.message.C2CMessage):
+                    # 非 C2C 场景：直接累积，最后统一发
+                    if not self.send_buffer:
+                        self.send_buffer = chain
+                    else:
+                        self.send_buffer.chain.extend(chain.chain)
+                    continue
+
+                # ---- C2C 流式场景 ----
+
+                # tool_call break 信号：工具开始执行，先把已有 buffer 以 state=10 结束当前流式段
+                if chain.type == "break":
+                    if self.send_buffer:
+                        stream_payload["state"] = 10
+                        ret = await self._post_send(stream=stream_payload)
+                        if ret is not None and isinstance(ret, dict) and ret.get("id") is not None:
+                            stream_payload["id"] = ret.get("id")
+                    # 重置 stream_payload，为下一段流式做准备
+                    stream_payload = {"state": 1, "id": None, "index": 0, "reset": False}
+                    last_edit_time = 0
+                    continue
+
+                # 累积内容
+                if not self.send_buffer:
+                    self.send_buffer = chain
+                else:
+                    self.send_buffer.chain.extend(chain.chain)
+
+                # 节流：按时间间隔发送中间分片
+                current_time = asyncio.get_event_loop().time()
+                if current_time - last_edit_time >= throttle_interval:
+                    ret = cast(
+                        message.Message,
+                        await self._post_send(stream=stream_payload),
+                    )
+                    stream_payload["index"] += 1
+                    if ret is not None and isinstance(ret, dict) and ret.get("id") is not None:
+                        stream_payload["id"] = ret.get("id")
+                    last_edit_time = asyncio.get_event_loop().time()
+
+            if isinstance(source, botpy.message.C2CMessage):
+                # 结束流式对话，发送 buffer 中剩余内容
+                stream_payload["state"] = 10
+                ret = await self._post_send(stream=stream_payload)
+            else:
+                ret = await self._post_send()
+
+        except Exception as e:
+            logger.error(f"发送流式消息时出错: {e}", exc_info=True)
+            self.send_buffer = None
+
+        return await super().send_streaming(generator, use_fallback)
+
+    async def _post_send(self, stream: dict | None = None):
+        if not self.send_buffer:
+            return None
+
+        source = self.message_obj.raw_message
+
+        if not isinstance(
+            source,
+            botpy.message.Message
+            | botpy.message.GroupMessage
+            | botpy.message.DirectMessage
+            | botpy.message.C2CMessage,
+        ):
+            logger.warning(f"[QQOfficial] 不支持的消息源类型: {type(source)}")
+            return None
+
+        (
+            plain_text,
+            image_base64,
+            image_path,
+            record_file_path,
+        ) = await QQOfficialMessageEvent._parse_to_qqofficial(self.send_buffer)
+
+        if (
+            not plain_text
+            and not image_base64
+            and not image_path
+            and not record_file_path
+        ):
+            return None
+
+        # 注意：不对中间分片追加 \n，否则 QQ 流式追加模式下用户会看到多余换行
+        # QQ C2C 流式 API 是增量追加模式，每片内容直接拼接显示，末尾 \n 会变成可见换行
+
+        payload: dict = {
+            # "content": plain_text,
+            "markdown": MarkdownPayload(content=plain_text) if plain_text else None,
+            "msg_type": 2,
+            "msg_id": self.message_obj.message_id,
+        }
+
+        if not isinstance(source, botpy.message.Message | botpy.message.DirectMessage):
+            payload["msg_seq"] = random.randint(1, 10000)
+
+        ret = None
+
+        match source:
+            case botpy.message.GroupMessage():
+                if not source.group_openid:
+                    logger.error("[QQOfficial] GroupMessage 缺少 group_openid")
+                    return None
+
+                if image_base64:
+                    media = await self.upload_group_and_c2c_image(
+                        image_base64,
+                        1,
+                        group_openid=source.group_openid,
+                    )
+                    payload["media"] = media
+                    payload["msg_type"] = 7
+                    payload.pop("markdown", None)
+                    payload["content"] = plain_text or None
+                if record_file_path:  # group record msg
+                    media = await self.upload_group_and_c2c_record(
+                        record_file_path,
+                        3,
+                        group_openid=source.group_openid,
+                    )
+                    payload["media"] = media
+                    payload["msg_type"] = 7
+                    payload.pop("markdown", None)
+                    payload["content"] = plain_text or None
+                ret = await self._send_with_markdown_fallback(
+                    send_func=lambda retry_payload: self.bot.api.post_group_message(
+                        group_openid=source.group_openid,  # type: ignore
+                        **retry_payload,
+                    ),
+                    payload=payload,
+                    plain_text=plain_text,
+                )
+
+            case botpy.message.C2CMessage():
+                if image_base64:
+                    media = await self.upload_group_and_c2c_image(
+                        image_base64,
+                        1,
+                        openid=source.author.user_openid,
+                    )
+                    payload["media"] = media
+                    payload["msg_type"] = 7
+                    payload.pop("markdown", None)
+                    payload["content"] = plain_text or None
+                if record_file_path:  # c2c record
+                    media = await self.upload_group_and_c2c_record(
+                        record_file_path,
+                        3,
+                        openid=source.author.user_openid,
+                    )
+                    payload["media"] = media
+                    payload["msg_type"] = 7
+                    payload.pop("markdown", None)
+                    payload["content"] = plain_text or None
+                if stream:
+                    ret = await self._send_with_markdown_fallback(
+                        send_func=lambda retry_payload: self.post_c2c_message(
+                            openid=source.author.user_openid,
+                            **retry_payload,
+                            stream=stream,
+                        ),
+                        payload=payload,
+                        plain_text=plain_text,
+                    )
+                else:
+                    ret = await self._send_with_markdown_fallback(
+                        send_func=lambda retry_payload: self.post_c2c_message(
+                            openid=source.author.user_openid,
+                            **retry_payload,
+                        ),
+                        payload=payload,
+                        plain_text=plain_text,
+                    )
+                logger.debug(f"Message sent to C2C: {ret}")
+
+            case botpy.message.Message():
+                if image_path:
+                    payload["file_image"] = image_path
+                # Guild text-channel send API (/channels/{channel_id}/messages) does not use v2 msg_type.
+                payload.pop("msg_type", None)
+                ret = await self._send_with_markdown_fallback(
+                    send_func=lambda retry_payload: self.bot.api.post_message(
+                        channel_id=source.channel_id,
+                        **retry_payload,
+                    ),
+                    payload=payload,
+                    plain_text=plain_text,
+                )
+
+            case botpy.message.DirectMessage():
+                if image_path:
+                    payload["file_image"] = image_path
+                # Guild DM send API (/dms/{guild_id}/messages) does not use v2 msg_type.
+                payload.pop("msg_type", None)
+                ret = await self._send_with_markdown_fallback(
+                    send_func=lambda retry_payload: self.bot.api.post_dms(
+                        guild_id=source.guild_id,
+                        **retry_payload,
+                    ),
+                    payload=payload,
+                    plain_text=plain_text,
+                )
+
+            case _:
+                pass
+
+        await super().send(self.send_buffer)
+
+        self.send_buffer = None
+
+        return ret
+
+    async def _send_with_markdown_fallback(
+        self,
+        send_func,
+        payload: dict,
+        plain_text: str,
+    ):
+        try:
+            return await send_func(payload)
+        except botpy.errors.ServerError as err:
+            if (
+                self.MARKDOWN_NOT_ALLOWED_ERROR not in str(err)
+                or not payload.get("markdown")
+                or not plain_text
+            ):
+                raise
+
+            logger.warning(
+                "[QQOfficial] markdown 发送被拒绝，回退到 content 模式重试。"
+            )
+            fallback_payload = payload.copy()
+            fallback_payload["markdown"] = None
+            fallback_payload["content"] = plain_text
+            if fallback_payload.get("msg_type") == 2:
+                fallback_payload["msg_type"] = 0
+            return await send_func(fallback_payload)
+
+    async def upload_group_and_c2c_image(
+        self,
+        image_base64: str,
+        file_type: int,
+        **kwargs,
+    ) -> botpy.types.message.Media:
+        payload = {
+            "file_data": image_base64,
+            "file_type": file_type,
+            "srv_send_msg": False,
+        }
+
+        result = None
+        if "openid" in kwargs:
+            payload["openid"] = kwargs["openid"]
+            route = Route("POST", "/v2/users/{openid}/files", openid=kwargs["openid"])
+            result = await self.bot.api._http.request(route, json=payload)
+        elif "group_openid" in kwargs:
+            payload["group_openid"] = kwargs["group_openid"]
+            route = Route(
+                "POST",
+                "/v2/groups/{group_openid}/files",
+                group_openid=kwargs["group_openid"],
+            )
+            result = await self.bot.api._http.request(route, json=payload)
+        else:
+            raise ValueError("Invalid upload parameters")
+
+        if not isinstance(result, dict):
+            raise RuntimeError(
+                f"Failed to upload image, response is not dict: {result}"
+            )
+
+        return Media(
+            file_uuid=result["file_uuid"],
+            file_info=result["file_info"],
+            ttl=result.get("ttl", 0),
+        )
+
+    async def upload_group_and_c2c_record(
+        self,
+        file_source: str,
+        file_type: int,
+        srv_send_msg: bool = False,
+        **kwargs,
+    ) -> Media | None:
+        """上传媒体文件"""
+        # 构建基础payload
+        payload = {"file_type": file_type, "srv_send_msg": srv_send_msg}
+
+        # 处理文件数据
+        if os.path.exists(file_source):
+            # 读取本地文件
+            async with aiofiles.open(file_source, "rb") as f:
+                file_content = await f.read()
+                # use base64 encode
+                payload["file_data"] = base64.b64encode(file_content).decode("utf-8")
+        else:
+            # 使用URL
+            payload["url"] = file_source
+
+        # 添加接收者信息和确定路由
+        if "openid" in kwargs:
+            payload["openid"] = kwargs["openid"]
+            route = Route("POST", "/v2/users/{openid}/files", openid=kwargs["openid"])
+        elif "group_openid" in kwargs:
+            payload["group_openid"] = kwargs["group_openid"]
+            route = Route(
+                "POST",
+                "/v2/groups/{group_openid}/files",
+                group_openid=kwargs["group_openid"],
+            )
+        else:
+            return None
+
+        try:
+            # 使用底层HTTP请求
+            result = await self.bot.api._http.request(route, json=payload)
+
+            if result:
+                if not isinstance(result, dict):
+                    logger.error(f"上传文件响应格式错误: {result}")
+                    return None
+
+                return Media(
+                    file_uuid=result["file_uuid"],
+                    file_info=result["file_info"],
+                    ttl=result.get("ttl", 0),
+                )
+        except Exception as e:
+            logger.error(f"上传请求错误: {e}")
+
+        return None
+
+    async def post_c2c_message(
+        self,
+        openid: str,
+        msg_type: int = 0,
+        content: str | None = None,
+        embed: message.Embed | None = None,
+        ark: message.Ark | None = None,
+        message_reference: message.Reference | None = None,
+        media: message.Media | None = None,
+        msg_id: str | None = None,
+        msg_seq: int | None = 1,
+        event_id: str | None = None,
+        markdown: message.MarkdownPayload | None = None,
+        keyboard: message.Keyboard | None = None,
+        stream: dict | None = None,
+    ) -> message.Message:
+        payload = locals()
+        payload.pop("self", None)
+        # QQ API does not accept stream.id=None; remove it when not yet assigned
+        if "stream" in payload and payload["stream"] is not None:
+            stream_data = dict(payload["stream"])
+            if stream_data.get("id") is None:
+                stream_data.pop("id", None)
+            payload["stream"] = stream_data
+        route = Route("POST", "/v2/users/{openid}/messages", openid=openid)
+        result = await self.bot.api._http.request(route, json=payload)
+
+        if result is None:
+            logger.warning("[QQOfficial] post_c2c_message: API 返回 None，跳过本次发送")
+            return None
+        if not isinstance(result, dict):
+            logger.error(f"[QQOfficial] post_c2c_message: 响应不是 dict: {result}")
+            return None
+
+        return message.Message(**result)
+
+    @staticmethod
+    async def _parse_to_qqofficial(message: MessageChain):
+        plain_text = ""
+        image_base64 = None  # only one img supported
+        image_file_path = None
+        record_file_path = None
+        for i in message.chain:
+            if isinstance(i, Plain):
+                plain_text += i.text
+            elif isinstance(i, Image) and not image_base64:
+                if i.file and i.file.startswith("file:///"):
+                    image_base64 = file_to_base64(i.file[8:])
+                    image_file_path = i.file[8:]
+                elif i.file and i.file.startswith("http"):
+                    image_file_path = await download_image_by_url(i.file)
+                    image_base64 = file_to_base64(image_file_path)
+                elif i.file and i.file.startswith("base64://"):
+                    image_base64 = i.file
+                elif i.file:
+                    image_base64 = file_to_base64(i.file)
+                else:
+                    raise ValueError("Unsupported image file format")
+                image_base64 = image_base64.removeprefix("base64://")
+            elif isinstance(i, Record):
+                if i.file:
+                    record_wav_path = await i.convert_to_file_path()  # wav 路径
+                    temp_dir = get_astrbot_temp_path()
+                    record_tecent_silk_path = os.path.join(
+                        temp_dir,
+                        f"qqofficial_{uuid.uuid4()}.silk",
+                    )
+                    try:
+                        duration = await wav_to_tencent_silk(
+                            record_wav_path,
+                            record_tecent_silk_path,
+                        )
+                        if duration > 0:
+                            record_file_path = record_tecent_silk_path
+                        else:
+                            record_file_path = None
+                            logger.error("转换音频格式时出错：音频时长不大于0")
+                    except Exception as e:
+                        logger.error(f"处理语音时出错: {e}")
+                        record_file_path = None
+            else:
+                logger.debug(f"qq_official 忽略 {i.type}")
+        return plain_text, image_base64, image_file_path, record_file_path
