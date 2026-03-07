@@ -513,11 +513,7 @@ class ProviderOpenAIOfficial(Provider):
                     ):
                         # workaround for #1454
                         if isinstance(tool_call.function.arguments, str):
-                            _args_str = tool_call.function.arguments.strip()
-                            if not _args_str:
-                                args = {}
-                            else:
-                                args = json.loads(_args_str)
+                            args = json.loads(tool_call.function.arguments)
                         else:
                             args = tool_call.function.arguments
                         args_ls.append(args)
