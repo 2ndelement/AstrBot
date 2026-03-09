@@ -147,11 +147,34 @@ class MemorySystemPlugin(Star):
     async def inject_memory_context(
         self, event: AstrMessageEvent, req: ProviderRequest
     ) -> None:
-        """在每次 LLM 请求前将三层记忆注入 system_prompt。"""
+        """在每次 LLM 请求前将三层记忆注入 system_prompt，并在上下文过大时自动截断。"""
+        import json as _json
+
+        # 1. 注入记忆上下文
         block = _build_context_block()
         if block:
             req.system_prompt = (req.system_prompt or "") + block
             logger.debug("[MemorySystem] 已注入记忆上下文（%d chars）", len(block))
+
+        # 2. 预防性历史截断：如果 history 消息总 chars 超过阈值，自动截断旧消息
+        AUTO_COMPACT_CHARS = 200_000  # 约 50k tokens 时自动截断（保守阈值）
+        KEEP_RECENT_TURNS = 20
+        try:
+            if req.contexts:
+                contexts_str = _json.dumps(req.contexts, ensure_ascii=False)
+                if len(contexts_str) > AUTO_COMPACT_CHARS:
+                    from astrbot.core.agent.context.truncator import ContextTruncator
+                    from astrbot.core.agent.message import Message as _Msg
+                    msgs = [_Msg.model_validate(m) if isinstance(m, dict) else m for m in req.contexts]
+                    _truncator = ContextTruncator()
+                    truncated = _truncator.truncate_by_turns(msgs, keep_most_recent_turns=KEEP_RECENT_TURNS)
+                    req.contexts = [m.model_dump() if hasattr(m, "model_dump") else m for m in truncated]
+                    logger.warning(
+                        "[MemorySystem] 自动截断历史上下文：%d -> %d 条消息（原始 %d chars 超过阈值 %d）",
+                        len(msgs), len(truncated), len(contexts_str), AUTO_COMPACT_CHARS,
+                    )
+        except Exception as _e:
+            logger.warning("[MemorySystem] 预防性截断失败（非致命）: %s", _e)
 
     # ════════════════════════════════════════
     #  LLM 工具：写日记
@@ -381,15 +404,39 @@ class MemorySystemPlugin(Star):
     @filter.command("compact")
     async def cmd_compact(self, event: AstrMessageEvent) -> None:
         """
-        手动触发 LLM Summary 上下文压缩，将当前会话历史压缩为摘要。
-        用法：/compact
+        手动触发上下文压缩。
+        用法：
+          /compact         — LLM 摘要压缩，保留最近 6 轮
+          /compact 10      — LLM 摘要压缩，保留最近 10 轮
+          /compact hard    — 强制截断，只保留最近 20 轮（不消耗 LLM）
+          /compact clear   — 清空全部历史（谨慎！）
         """
         import json
         from astrbot.core.agent.context.compressor import LLMSummaryCompressor
+        from astrbot.core.agent.context.truncator import ContextTruncator
         from astrbot.core.agent.message import Message
 
         umo = event.unified_msg_origin
         conv_mgr = self.context.conversation_manager
+
+        # 解析参数
+        raw_msg = event.message_str.strip()
+        args = raw_msg.split()[1:]  # 去掉 /compact
+        mode = "llm"
+        keep_recent = 6
+        if args:
+            arg0 = args[0].lower()
+            if arg0 == "hard":
+                mode = "hard"
+                keep_recent = 20
+            elif arg0 == "clear":
+                mode = "clear"
+            else:
+                try:
+                    keep_recent = max(2, int(arg0))
+                except ValueError:
+                    yield event.plain_result("⚠️ 参数无效，请用 /compact [数字|hard|clear]")
+                    return
 
         # 1. 获取当前 conversation
         cid = await conv_mgr.get_curr_conversation_id(umo)
@@ -403,29 +450,58 @@ class MemorySystemPlugin(Star):
             return
 
         history: list[dict] = json.loads(conv.history) if isinstance(conv.history, str) else (conv.history or [])
-        # 过滤掉 system 消息，只保留 user/assistant 轮次
         non_system = [m for m in history if m.get("role") != "system"]
-        if len(non_system) < 4:
-            yield event.plain_result("📭 当前对话内容太少，不需要压缩（少于 4 条非系统消息）～")
+
+        if mode == "clear":
+            await conv_mgr.update_conversation(
+                unified_msg_origin=umo,
+                conversation_id=cid,
+                history=[],
+            )
+            yield event.plain_result(f"🗑️ 已清空全部历史记录（原有 {len(non_system)} 条消息）")
             return
 
-        # 2. 获取当前 provider
+        if len(non_system) < 2:
+            yield event.plain_result("📭 当前对话内容太少，不需要压缩～")
+            return
+
+        if mode == "hard":
+            # 仅截断，不使用 LLM
+            msgs = [Message.model_validate(m) if isinstance(m, dict) else m for m in history]
+            _truncator = ContextTruncator()
+            truncated = _truncator.truncate_by_turns(msgs, keep_most_recent_turns=keep_recent)
+            result_dicts = [m.model_dump() if hasattr(m, "model_dump") else dict(m) for m in truncated]
+            await conv_mgr.update_conversation(
+                unified_msg_origin=umo,
+                conversation_id=cid,
+                history=result_dicts,
+            )
+            after_cnt = len([m for m in result_dicts if m.get("role") != "system"])
+            yield event.plain_result(
+                f"✂️ 强制截断完成！\n"
+                f"🔹 截断前：{len(non_system)} 条消息\n"
+                f"🔹 截断后：{after_cnt} 条消息（保留最近 {keep_recent} 轮）"
+            )
+            return
+
+        # LLM 摘要压缩
         provider = self.context.get_using_provider(umo)
         if not provider:
-            yield event.plain_result("⚠️ 当前没有可用的 LLM Provider，无法进行 LLM 摘要压缩～")
+            yield event.plain_result("⚠️ 当前没有可用的 LLM Provider，尝试用 /compact hard 代替")
             return
 
-        yield event.plain_result(f"🗜️ 正在压缩上下文（共 {len(non_system)} 条消息），请稍等～")
+        chars_before = len(json.dumps(history, ensure_ascii=False))
+        yield event.plain_result(
+            f"🗜️ 正在 LLM 摘要压缩（{len(non_system)} 条消息，约 {chars_before//4:,} tokens），保留最近 {keep_recent} 轮，请稍等～"
+        )
 
-        # 3. 构建 LLMSummaryCompressor 并执行压缩
         compressor = LLMSummaryCompressor(
             provider=provider,
-            keep_recent=4,
+            keep_recent=keep_recent,
         )
-        messages = [Message(**m) if not isinstance(m, Message) else m for m in history]
+        messages = [Message.model_validate(m) if isinstance(m, dict) else m for m in history]
         compressed = await compressor(messages)
 
-        # 4. 写回 conversation
         compressed_dicts = [m.model_dump() if hasattr(m, "model_dump") else dict(m) for m in compressed]
         await conv_mgr.update_conversation(
             unified_msg_origin=umo,
@@ -433,12 +509,13 @@ class MemorySystemPlugin(Star):
             history=compressed_dicts,
         )
 
-        before_cnt = len(non_system)
+        chars_after = len(json.dumps(compressed_dicts, ensure_ascii=False))
         after_cnt = len([m for m in compressed_dicts if m.get("role") != "system"])
         yield event.plain_result(
-            f"✅ 上下文压缩完成！\n"
-            f"🔹 压缩前：{before_cnt} 条消息\n"
-            f"🔹 压缩后：{after_cnt} 条消息（保留了最近 4 轮 + 摘要）"
+            f"✅ LLM 摘要压缩完成！\n"
+            f"🔹 压缩前：{len(non_system)} 条消息 / ~{chars_before//4:,} tokens\n"
+            f"🔹 压缩后：{after_cnt} 条消息 / ~{chars_after//4:,} tokens\n"
+            f"🔹 压缩率：{(1 - chars_after/max(chars_before,1))*100:.1f}%（保留最近 {keep_recent} 轮 + 摘要）"
         )
 
     async def terminate(self) -> None:

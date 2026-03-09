@@ -298,36 +298,63 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                         candidate_id,
                     )
                     try:
-                        _before = len(self.run_context.messages)
-                        # Force halving truncation regardless of threshold
                         from astrbot.core.agent.context.truncator import ContextTruncator
                         _truncator = ContextTruncator()
-                        self.run_context.messages = _truncator.truncate_by_halving(
-                            self.run_context.messages
-                        )
-                        _after = len(self.run_context.messages)
-                        logger.info(
-                            "Forced context truncation: %d -> %d messages, retrying same provider.",
-                            _before, _after,
-                        )
-                        # Retry same candidate once after compression
-                        try:
-                            async for resp in self._iter_llm_responses(include_model=idx == 0):
-                                if resp.is_chunk:
-                                    has_stream_output = True
-                                    yield resp
-                                    continue
-                                yield resp
-                                return
-                            if has_stream_output:
-                                return
-                        except Exception as retry_exc:
-                            last_exception = retry_exc
-                            logger.warning(
-                                "Chat Model %s retry after compression also failed: %s",
-                                candidate_id,
-                                retry_exc,
+                        _before_total = len(self.run_context.messages)
+                        # Aggressively halve until small enough (up to 5 rounds)
+                        _compression_success = False
+                        for _halve_round in range(5):
+                            _before = len(self.run_context.messages)
+                            self.run_context.messages = _truncator.truncate_by_halving(
+                                self.run_context.messages
                             )
+                            _after = len(self.run_context.messages)
+                            logger.info(
+                                "Forced context truncation round %d: %d -> %d messages.",
+                                _halve_round + 1, _before, _after,
+                            )
+                            if _after <= 4:
+                                break  # Can't shrink further
+                            # Retry same candidate
+                            try:
+                                async for resp in self._iter_llm_responses(include_model=idx == 0):
+                                    if resp.is_chunk:
+                                        has_stream_output = True
+                                        yield resp
+                                        continue
+                                    yield resp
+                                    logger.info(
+                                        "Context truncation succeeded after %d round(s): %d -> %d messages.",
+                                        _halve_round + 1, _before_total, _after,
+                                    )
+                                    _compression_success = True
+                                    return
+                                if has_stream_output:
+                                    _compression_success = True
+                                    return
+                                _compression_success = True
+                                break  # succeeded without stream output
+                            except Exception as retry_exc:
+                                _exc_str2 = str(retry_exc).lower()
+                                if not (
+                                    "model_max_prompt_tokens_exceeded" in _exc_str2
+                                    or "prompt token count" in _exc_str2
+                                    or "tokens_exceeded" in _exc_str2
+                                    or "context_length_exceeded" in _exc_str2
+                                    or ("token" in _exc_str2 and "exceed" in _exc_str2)
+                                ):
+                                    last_exception = retry_exc
+                                    logger.warning(
+                                        "Chat Model %s retry after compression failed: %s",
+                                        candidate_id, retry_exc,
+                                    )
+                                    break
+                                last_exception = retry_exc
+                                logger.warning(
+                                    "Chat Model %s still token-exceeded after round %d, halving again...",
+                                    candidate_id, _halve_round + 1,
+                                )
+                                continue
                     except Exception as compress_exc:
                         logger.error("Failed to compress context: %s", compress_exc)
                     continue
@@ -760,6 +787,14 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         logger.info(f"Agent 使用工具: {llm_response.tools_call_name}")
 
         def _append_tool_call_result(tool_call_id: str, content: str) -> None:
+            # Truncate oversized tool results to prevent context bloat
+            MAX_TOOL_RESULT_CHARS = 12000
+            if len(content) > MAX_TOOL_RESULT_CHARS:
+                truncated_len = len(content) - MAX_TOOL_RESULT_CHARS
+                content = (
+                    content[:MAX_TOOL_RESULT_CHARS]
+                    + f"\n... [TRUNCATED {truncated_len} chars to prevent context overflow]"
+                )
             tool_call_result_blocks.append(
                 ToolCallMessageSegment(
                     role="tool",
