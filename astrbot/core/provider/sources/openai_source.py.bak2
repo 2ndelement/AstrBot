@@ -248,29 +248,11 @@ class ProviderOpenAIOfficial(Provider):
 
         model = payloads.get("model", "").lower()
 
-        _max_retries = 3
-        _last_exc = None
-        for _attempt in range(1, _max_retries + 1):
-            try:
-                completion = await self.client.chat.completions.create(
-                    **payloads,
-                    stream=False,
-                    extra_body=extra_body,
-                )
-                break
-            except Exception as _e:
-                _last_exc = _e
-                if _attempt < _max_retries:
-                    _wait = 2 ** (_attempt - 1)
-                    logger.warning(
-                        f"[_query] 请求失败（第 {_attempt}/{_max_retries} 次），{_wait}s 后重试。原因：{_e}"
-                    )
-                    await asyncio.sleep(_wait)
-                else:
-                    logger.error(
-                        f"[_query] 已重试 {_max_retries} 次仍失败，放弃。原因：{_e}"
-                    )
-                    raise _last_exc
+        completion = await self.client.chat.completions.create(
+            **payloads,
+            stream=False,
+            extra_body=extra_body,
+        )
 
         if not isinstance(completion, ChatCompletion):
             raise Exception(
@@ -557,10 +539,8 @@ class ProviderOpenAIOfficial(Provider):
                 "API 返回的 completion 由于内容安全过滤被拒绝(非 AstrBot)。",
             )
         if llm_response.completion_text is None and not llm_response.tools_call_args:
-            # If finish_reason is tool_calls but no tool matched, it may be an unknown tool.
-            # Strategy: inject a tool-result error for each unknown call so the LLM sees
-            # "tool not found" feedback, then force completion_text to a stop message so the
-            # runner transitions to DONE instead of looping indefinitely.
+            # If finish_reason is tool_calls but no tool matched, it may be an unknown tool
+            # In that case, treat it as a graceful skip rather than a fatal parse error
             if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
                 _unknown_tools = [tc.function.name for tc in choice.message.tool_calls if hasattr(tc, 'function')]
                 logger.warning(
@@ -568,9 +548,7 @@ class ProviderOpenAIOfficial(Provider):
                     f"Tool calls returned: {_unknown_tools}. "
                     f"Skipping tool dispatch."
                 )
-                # Pass the unknown tool calls to the runner so it can inject proper tool-result
-                # messages into the context (telling the LLM the tools don't exist).
-                # Setting tools_call_name lets _handle_function_tools append the error results.
+                # 将未知工具调用转为带 ID 的 tool 响应，让 runner 处理 "not found" 并通知 LLM，打破无限循环
                 llm_response.role = "tool"
                 llm_response.tools_call_args = [{}] * len(choice.message.tool_calls)
                 llm_response.tools_call_name = _unknown_tools
@@ -578,18 +556,10 @@ class ProviderOpenAIOfficial(Provider):
                     tc.id if hasattr(tc, 'id') else f"unknown_{i}"
                     for i, tc in enumerate(choice.message.tool_calls)
                 ]
-                # Mark as terminal: runner will still inject tool error results, but after that
-                # the agent should stop. We set a sentinel so the runner can detect this case.
-                llm_response.completion_text = "__UNKNOWN_TOOL_STOP__"
-            else:
-                # Empty/unparseable completion (e.g. model returned content=None with finish_reason=stop)
-                # Return a special sentinel so the runner retries instead of crashing the tool chain
-                logger.warning(
-                    f"API returned unparseable completion (content=None, no tool_calls). "
-                    f"Treating as empty response and retrying. completion: {completion}"
-                )
                 llm_response.completion_text = ""
-                llm_response.role = "err_retry"
+            else:
+                logger.error(f"API 返回的 completion 无法解析：{completion}。")
+                raise Exception(f"API 返回的 completion 无法解析：{completion}。")
 
         llm_response.raw_completion = completion
         llm_response.id = completion.id

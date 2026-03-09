@@ -183,6 +183,32 @@ class InternalAgentSubStage(Stage):
 
             async with session_lock_manager.acquire_lock(event.unified_msg_origin):
                 logger.debug("acquired session lock for llm request")
+
+                # Re-attempt follow-up capture after acquiring the lock.
+                # This handles the race condition where a follow-up message arrives
+                # *before* the active runner is registered (i.e., during build_main_agent).
+                # After lock acquisition the previous runner is guaranteed to be done,
+                # so if an active runner is present now it must be a concurrently-registered
+                # one on a *different* coroutine, which means we should still try to attach.
+                if follow_up_capture is None:
+                    follow_up_capture_retry = try_capture_follow_up(event)
+                    if follow_up_capture_retry is not None:
+                        logger.info(
+                            "Late follow-up capture after lock, umo=%s",
+                            event.unified_msg_origin,
+                        )
+                        follow_up_capture = follow_up_capture_retry
+                        (
+                            follow_up_consumed_marked,
+                            follow_up_activated,
+                        ) = await prepare_follow_up_capture(follow_up_capture)
+                        if follow_up_consumed_marked:
+                            logger.info(
+                                "Late follow-up ticket already consumed, stopping. umo=%s",
+                                event.unified_msg_origin,
+                            )
+                            return
+
                 agent_runner: AgentRunner | None = None
                 runner_registered = False
                 try:
@@ -368,7 +394,27 @@ class InternalAgentSubStage(Stage):
                         unregister_active_runner(event.unified_msg_origin, agent_runner)
 
         except Exception as e:
-            logger.error(f"Error occurred while processing agent: {e}")
+            logger.error(f"Error occurred while processing agent: {e}", exc_info=True)
+            # 尝试保存已有的会话上下文，防止请求失败后上下文丢失
+            try:
+                if (
+                    "agent_runner" in dir()
+                    and agent_runner is not None
+                    and "req" in dir()
+                    and req is not None
+                    and agent_runner.run_context.messages
+                ):
+                    await self._save_to_history(
+                        event,
+                        req,
+                        agent_runner.get_final_llm_resp(),
+                        agent_runner.run_context.messages,
+                        agent_runner.stats,
+                        user_aborted=False,
+                    )
+                    logger.info("请求失败，已保存已有上下文以防止历史丢失。")
+            except Exception as save_err:
+                logger.warning(f"保存上下文时出错（非致命）: {save_err}")
             custom_error_message = extract_persona_custom_error_message_from_event(
                 event
             )

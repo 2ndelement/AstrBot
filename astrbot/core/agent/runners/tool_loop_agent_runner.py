@@ -158,6 +158,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         self._aborted = False
         self._pending_follow_ups: list[FollowUpTicket] = []
         self._follow_up_seq = 0
+        self._unknown_tool_consecutive_count = 0  # Track consecutive unknown tool calls
 
         # These two are used for tool schema mode handling
         # We now have two modes:
@@ -246,6 +247,24 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                         yield resp
                         continue
 
+                    if resp.role == "err_retry":
+                        # Empty/unparseable response from model, retry same provider once
+                        logger.warning(
+                            "Chat Model %s returned empty/unparseable completion, retrying once...",
+                            candidate_id,
+                        )
+                        try:
+                            async for retry_resp in self._iter_llm_responses(include_model=idx == 0):
+                                if retry_resp.is_chunk:
+                                    yield retry_resp
+                                    continue
+                                yield retry_resp
+                                return
+                        except Exception as retry_exc:
+                            logger.warning("Retry also failed: %s", retry_exc)
+                            last_exception = retry_exc
+                        break
+
                     if (
                         resp.role == "err"
                         and not has_stream_output
@@ -265,6 +284,53 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                     return
             except Exception as exc:  # noqa: BLE001
                 last_exception = exc
+                # Auto-compress context when model_max_prompt_tokens_exceeded
+                _exc_str = str(exc).lower()
+                if (
+                    "model_max_prompt_tokens_exceeded" in _exc_str
+                    or "prompt token count" in _exc_str
+                    or "tokens_exceeded" in _exc_str
+                    or "context_length_exceeded" in _exc_str
+                    or ("token" in _exc_str and "exceed" in _exc_str)
+                ):
+                    logger.warning(
+                        "Chat Model %s: token limit exceeded, forcing context compression and retrying...",
+                        candidate_id,
+                    )
+                    try:
+                        _before = len(self.run_context.messages)
+                        # Force halving truncation regardless of threshold
+                        from astrbot.core.agent.context.truncator import ContextTruncator
+                        _truncator = ContextTruncator()
+                        self.run_context.messages = _truncator.truncate_by_halving(
+                            self.run_context.messages
+                        )
+                        _after = len(self.run_context.messages)
+                        logger.info(
+                            "Forced context truncation: %d -> %d messages, retrying same provider.",
+                            _before, _after,
+                        )
+                        # Retry same candidate once after compression
+                        try:
+                            async for resp in self._iter_llm_responses(include_model=idx == 0):
+                                if resp.is_chunk:
+                                    has_stream_output = True
+                                    yield resp
+                                    continue
+                                yield resp
+                                return
+                            if has_stream_output:
+                                return
+                        except Exception as retry_exc:
+                            last_exception = retry_exc
+                            logger.warning(
+                                "Chat Model %s retry after compression also failed: %s",
+                                candidate_id,
+                                retry_exc,
+                            )
+                    except Exception as compress_exc:
+                        logger.error("Failed to compress context: %s", compress_exc)
+                    continue
                 logger.warning(
                     "Chat Model %s request error: %s",
                     candidate_id,
@@ -332,10 +398,11 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             f"{idx}. {ticket.text}" for idx, ticket in enumerate(follow_ups, start=1)
         )
         return (
-            "\n\n[SYSTEM NOTICE] User sent follow-up messages while tool execution "
-            "was in progress. Prioritize these follow-up instructions in your next "
-            "actions. In your very next action, briefly acknowledge to the user "
-            "that their follow-up message(s) were received before continuing.\n"
+            "\n\n[FOLLOW-UP] The user sent additional message(s) while you were working. "
+            "Treat these as supplementary instructions for the current task — DO NOT stop "
+            "or restart the current operation. Instead, seamlessly incorporate them into "
+            "your ongoing work. Continue the task flow without interrupting it. "
+            "Do NOT acknowledge receipt explicitly; just act on them naturally.\n"
             f"{follow_up_lines}"
         )
 
@@ -532,6 +599,25 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             if self.tool_schema_mode == "skills_like":
                 llm_resp, _ = await self._resolve_tool_exec(llm_resp)
 
+            # Detect sentinel set by openai_source when LLM called an unknown tool.
+            # We still run _handle_function_tools so tool-result error messages are
+            # injected into the context, but afterwards we force the agent to DONE
+            # only if this happens consecutively (to avoid false positives from param errors).
+            _is_unknown_tool_call = (
+                llm_resp.completion_text == "__UNKNOWN_TOOL_STOP__"
+            )
+            if _is_unknown_tool_call:
+                self._unknown_tool_consecutive_count += 1
+                llm_resp.completion_text = ""  # clear sentinel before passing to handler
+            else:
+                self._unknown_tool_consecutive_count = 0
+            # Only force DONE after 2+ consecutive unknown tool calls
+            _UNKNOWN_TOOL_MAX_RETRIES = 2
+            _force_done_after_tool_handling = (
+                _is_unknown_tool_call
+                and self._unknown_tool_consecutive_count >= _UNKNOWN_TOOL_MAX_RETRIES
+            )
+
             tool_call_result_blocks = []
             cached_images = []  # Collect cached images for LLM visibility
             async for result in self._handle_function_tools(self.req, llm_resp):
@@ -617,6 +703,23 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                         )
 
             self.req.append_tool_calls_result(tool_calls_result)
+
+            # If flagged as unknown-tool, force DONE now so we don't loop back to LLM.
+            if _force_done_after_tool_handling:
+                logger.warning(
+                    f"Unknown tool call detected {self._unknown_tool_consecutive_count} consecutive time(s); "
+                    "forcing agent DONE to prevent infinite retry loop."
+                )
+                self.final_llm_resp = llm_resp
+                self._transition_state(AgentState.DONE)
+                self.stats.end_time = time.time()
+                # Preserve context: on_agent_done hook should still be called
+                try:
+                    await self.agent_hooks.on_agent_done(self.run_context, llm_resp)
+                except Exception as e:
+                    logger.error(f"Error in on_agent_done hook: {e}", exc_info=True)
+                self._resolve_unconsumed_follow_ups()
+                return
 
     async def step_until_done(
         self, max_step: int
@@ -706,7 +809,8 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                     logger.warning(f"未找到指定的工具: {func_tool_name}，将跳过。")
                     _append_tool_call_result(
                         func_tool_id,
-                        f"error: Tool {func_tool_name} not found.",
+                        f"[SYSTEM ERROR] Tool '{func_tool_name}' is not available or does not exist. "
+                        f"Do NOT retry calling this tool. Please stop using tools and respond directly to the user based on information already gathered.",
                     )
                     continue
 
@@ -736,7 +840,36 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                         )
                 else:
                     # 如果没有 handler（如 MCP 工具），使用所有参数
-                    valid_params = func_tool_args
+                    # 但如果工具有 call() 方法（is_override_call），尝试从 call() 签名过滤参数
+                    import inspect as _inspect
+                    if hasattr(func_tool, 'call'):
+                        try:
+                            _sig = _inspect.signature(func_tool.call)
+                            _params = _sig.parameters
+                            # Check if the method accepts **kwargs (VAR_KEYWORD)
+                            _has_var_keyword = any(
+                                p.kind == _inspect.Parameter.VAR_KEYWORD
+                                for p in _params.values()
+                            )
+                            if _has_var_keyword:
+                                # **kwargs accepts anything, pass all args through
+                                valid_params = func_tool_args
+                            else:
+                                # func_tool.call is a bound method: signature is (context, arg1, arg2, ...)
+                                # skip 'context' (index 0), real args start at index 1
+                                _param_names = list(_params.keys())
+                                _expected = set(_param_names[1:]) if len(_param_names) > 1 else set()
+                                if _expected:
+                                    valid_params = {k: v for k, v in func_tool_args.items() if k in _expected}
+                                    _ignored = set(func_tool_args.keys()) - set(valid_params.keys())
+                                    if _ignored:
+                                        logger.warning(f"工具 {func_tool_name} (call方式) 忽略非期望参数: {_ignored}")
+                                else:
+                                    valid_params = func_tool_args
+                        except Exception:
+                            valid_params = func_tool_args
+                    else:
+                        valid_params = func_tool_args
 
                 try:
                     await self.agent_hooks.on_tool_start(

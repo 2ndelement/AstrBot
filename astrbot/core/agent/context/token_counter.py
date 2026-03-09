@@ -59,6 +59,9 @@ class EstimateTokenCounter:
         return total
 
     def _estimate_tokens(self, text: str) -> int:
+        # More accurate estimation:
+        # Chinese chars: ~1 char per token (tiktoken average)
+        # ASCII/other: ~4 chars per token
         chinese_count = len([c for c in text if "\u4e00" <= c <= "\u9fff"])
         other_count = len(text) - chinese_count
-        return int(chinese_count * 0.6 + other_count * 0.3)
+        return int(chinese_count * 1.0 + other_count * 0.25)

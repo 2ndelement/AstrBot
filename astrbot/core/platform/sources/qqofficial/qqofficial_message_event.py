@@ -124,7 +124,16 @@ class QQOfficialMessageEvent(AstrMessageEvent):
 
         except Exception as e:
             logger.error(f"发送流式消息时出错: {e}", exc_info=True)
-            self.send_buffer = None
+            # 流式发送失败时，尝试用已累积的 buffer 做非流式兜底发送
+            if self.send_buffer:
+                try:
+                    await self._post_send()
+                    logger.info("流式发送失败，已降级为非流式发送成功")
+                except Exception as e2:
+                    logger.error(f"非流式降级发送也失败: {e2}", exc_info=True)
+                    self.send_buffer = None
+            else:
+                self.send_buffer = None
 
         return await super().send_streaming(generator, use_fallback)
 
@@ -159,8 +168,11 @@ class QQOfficialMessageEvent(AstrMessageEvent):
         ):
             return None
 
-        # 注意：不对中间分片追加 \n，否则 QQ 流式追加模式下用户会看到多余换行
-        # QQ C2C 流式 API 是增量追加模式，每片内容直接拼接显示，末尾 \n 会变成可见换行
+        # QQ C2C 流式 API 说明：
+        # - 中间分片（state=0）：增量追加内容，不需要 \n
+        # - 最终分片（state=10）：结束流，content 必须以 \n 结尾（QQ API 要求）
+        if stream and stream.get("state") == 10 and plain_text and not plain_text.endswith("\n"):
+            plain_text = plain_text + "\n"
 
         payload: dict = {
             # "content": plain_text,

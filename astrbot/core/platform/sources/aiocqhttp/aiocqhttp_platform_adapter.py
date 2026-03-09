@@ -133,6 +133,10 @@ class AiocqhttpAdapter(Platform):
             if abm.sender.user_id == "2854196310":
                 # 屏蔽 QQ 管家的消息
                 return None
+            # 过滤完全空白的消息（如用户只是打开输入框又关闭，aiocqhttp 会推送空消息事件）
+            if not abm.message and not abm.message_str.strip():
+                logger.debug(f"[aiocqhttp] 过滤空消息事件，来自 user_id={abm.sender.user_id}")
+                return None
         elif event["post_type"] == "notice":
             abm = await self._convert_handle_notice_event(event)
         elif event["post_type"] == "request":
