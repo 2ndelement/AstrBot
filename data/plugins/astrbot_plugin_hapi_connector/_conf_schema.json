@@ -1,0 +1,94 @@
+{
+  "hapi_endpoint": {
+    "description": "HAPI 服务地址",
+    "type": "string",
+    "default": "",
+    "hint": "例如: http://localhost:3006"
+  },
+  "access_token": {
+    "description": "HAPI Access Token (支持 token:namespace 格式)",
+    "type": "string",
+    "default": ""
+  },
+  "proxy_url": {
+    "description": "代理地址 (支持 socks5h:// 和 http://)",
+    "type": "string",
+    "default": "",
+    "hint": "例如: socks5h://127.0.0.1:1080 或 http://127.0.0.1:7890"
+  },
+  "cf_access_client_id": {
+    "description": "Cloudflare Zero Trust Access Client ID（留空则不启用 CF 认证）",
+    "type": "string",
+    "default": "",
+    "hint": "部署在 Cloudflare Access 后面时需要填写，可在 Zero Trust 控制台创建 Service Token 获取"
+  },
+  "cf_access_client_secret": {
+    "description": "Cloudflare Zero Trust Access Client Secret",
+    "type": "string",
+    "default": "",
+    "hint": "与 Client ID 配对使用"
+  },
+  "jwt_lifetime": {
+    "description": "JWT 有效期 (秒)",
+    "type": "int",
+    "default": 900
+  },
+  "refresh_before_expiry": {
+    "description": "JWT 提前刷新时间 (秒)",
+    "type": "int",
+    "default": 180
+  },
+  "output_level": {
+    "description": "SSE 推送级别",
+    "type": "string",
+    "default": "detail",
+    "options": ["silence", "simple", "summary", "detail"],
+    "hint": "silence: 仅推送权限请求；simple: 推送纯文本消息及系统事件；summary: 任务完成时推送最近 N 条消息；detail: 实时推送所有消息"
+  },
+  "summary_msg_count": {
+    "description": "summary 推送级别显示的 agent 消息条数",
+    "type": "int",
+    "default": 5
+  },
+  "quick_prefix": {
+    "description": "快捷发送前缀",
+    "type": "string",
+    "default": ">",
+    "hint": "前缀后需加空格，如「> 消息内容」发送到当前会话，「>2 消息内容」发送到第 2 个会话"
+  },
+  "poke_approve": {
+    "description": "戳一戳自动全部审批",
+    "type": "bool",
+    "default": true,
+    "hint": "仅 QQ NapCat 可用"
+  },
+  "remind_pending": {
+    "description": "待审批请求超时重复提醒",
+    "type": "bool",
+    "default": true,
+    "hint": "防止 AI 会话缓存失效"
+  },
+  "remind_interval": {
+    "description": "待审批重复提醒间隔（秒）",
+    "type": "int",
+    "default": 180
+  },
+  "auto_approve_enabled": {
+    "description": "忙时托管审批：在指定时间范围内自动批准所有权限请求（默认关闭）",
+    "type": "bool",
+    "default": false,
+    "hint": "⚠️ 请谨慎开启，启用后 AI 将在指定时间段内无需确认自动执行所有操作"
+  },
+  "auto_approve_start": {
+    "description": "忙时托管审批开始时间（HH:MM，24小时制）",
+    "type": "string",
+    "default": "23:00"
+  },
+  "auto_approve_end": {
+    "description": "忙时托管审批结束时间（HH:MM，24小时制，可跨午夜）",
+    "type": "string",
+    "default": "07:00",
+    "hint": "例如开始 22:00、结束 08:00，即晚上10点到次日早上8点，支持跨午夜"
+  }
+}
+

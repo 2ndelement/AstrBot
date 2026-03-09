@@ -1,0 +1,6 @@
+name: subagent_manager
+display_name: 子代理管理器
+description: 企业级多 Agent 架构支持：子代理生命周期管理、工具沙箱、编排者模式、广播、Agent 间通信、上下文持久化。
+version: "2.0.0"
+author: Copilot
+repo: ""

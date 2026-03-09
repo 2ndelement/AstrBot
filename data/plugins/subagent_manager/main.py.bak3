@@ -1,0 +1,881 @@
+from __future__ import annotations
+
+import asyncio
+import copy
+import json
+import time
+import uuid
+from dataclasses import dataclass, field
+from typing import Any
+
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.star import Context, Star
+from astrbot.core.agent.tool import ToolSet
+from astrbot.core.astr_agent_context import AgentContextWrapper, AstrAgentContext
+from astrbot.core.astr_agent_hooks import MAIN_AGENT_HOOKS
+from astrbot.core.astr_agent_run_util import AgentRunner
+from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
+from astrbot.core.provider.entities import ProviderRequest
+
+# --------------------------------------------------------------------------- #
+#  工具黑名单
+#  _HARD_BLOCKED:  任何子代理都不能拥有，防止无限 spin-up 新子代理
+#  _ORCHESTRATOR_TOOLS: 编排者子代理可以拥有（receive_from / send_to 其他 agent）
+# --------------------------------------------------------------------------- #
+_HARD_BLOCKED_TOOL_NAMES = frozenset(
+    [
+        "init_subagent",          # 只有主 Agent 才能创建新子代理
+    ]
+)
+
+# 编排者可用的子代理管理工具（允许但不自动注入给普通子代理）
+_ORCHESTRATOR_TOOL_NAMES = frozenset(
+    [
+        "send_subagent_message",
+        "send_inter_agent_message",
+        "update_subagent_tools",
+        "close_subagent",
+        "list_subagents",
+        "update_subagent_metadata",
+        "broadcast_subagent_message",
+    ]
+)
+
+# 兼容旧代码（validate 等处用到）
+_SELF_TOOL_NAMES = _HARD_BLOCKED_TOOL_NAMES
+
+# 上下文滚动截断：超过此轮数时保留最新的
+_MAX_CONTEXT_TURNS = 40
+
+
+@dataclass
+class SubAgentState:
+    agent_id: str
+    display_name: str
+    system_prompt: str
+    allowed_tools: list[str] = field(default_factory=list)
+    contexts: list[dict[str, Any]] = field(default_factory=list)
+    role: str = ""                          # 可选角色标签，如 "researcher", "coder"
+    metadata: dict[str, Any] = field(default_factory=dict)
+    created_at: float = field(default_factory=lambda: time.time())
+    message_count: int = 0
+    is_orchestrator: bool = False           # 编排者标志：允许管理其他子代理
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "agent_id": self.agent_id,
+            "display_name": self.display_name,
+            "system_prompt": self.system_prompt,
+            "allowed_tools": list(self.allowed_tools),
+            "contexts": copy.deepcopy(self.contexts),
+            "role": self.role,
+            "metadata": copy.deepcopy(self.metadata),
+            "created_at": self.created_at,
+            "message_count": self.message_count,
+            "is_orchestrator": self.is_orchestrator,
+        }
+
+    def to_summary_dict(self) -> dict[str, Any]:
+        """返回不含 contexts 的摘要信息（用于 list_subagents）。"""
+        return {
+            "agent_id": self.agent_id,
+            "display_name": self.display_name,
+            "role": self.role,
+            "is_orchestrator": self.is_orchestrator,
+            "allowed_tools": list(self.allowed_tools),
+            "message_count": self.message_count,
+            "created_at": self.created_at,
+            "metadata": copy.deepcopy(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> SubAgentState:
+        return cls(
+            agent_id=str(data.get("agent_id", "")),
+            display_name=str(data.get("display_name", "")),
+            system_prompt=str(data.get("system_prompt", "")),
+            allowed_tools=[
+                str(name) for name in data.get("allowed_tools", []) if str(name).strip()
+            ],
+            contexts=copy.deepcopy(data.get("contexts", [])),
+            role=str(data.get("role", "")),
+            metadata=dict(data.get("metadata", {})),
+            created_at=float(data.get("created_at", 0.0)),
+            message_count=int(data.get("message_count", 0)),
+            is_orchestrator=bool(data.get("is_orchestrator", False)),
+        )
+
+
+class SubAgentRegistry:
+    def __init__(self, persist_cb) -> None:
+        self._lock = asyncio.Lock()
+        self._session_agents: dict[str, dict[str, SubAgentState]] = {}
+        self._persist_cb = persist_cb
+
+    def _snapshot_locked(self) -> dict[str, Any]:
+        return {
+            session_id: {
+                agent_id: state.to_dict() for agent_id, state in agents.items()
+            }
+            for session_id, agents in self._session_agents.items()
+        }
+
+    async def _persist_locked(self) -> None:
+        await self._persist_cb(self._snapshot_locked())
+
+    async def load(self, snapshot: dict[str, Any]) -> None:
+        async with self._lock:
+            rebuilt: dict[str, dict[str, SubAgentState]] = {}
+            for session_id, agents in snapshot.items():
+                if not isinstance(agents, dict):
+                    continue
+                bucket: dict[str, SubAgentState] = {}
+                for agent_id, raw in agents.items():
+                    if not isinstance(raw, dict):
+                        continue
+                    state = SubAgentState.from_dict(raw)
+                    if not state.agent_id:
+                        state.agent_id = str(agent_id)
+                    bucket[state.agent_id] = state
+                if bucket:
+                    rebuilt[str(session_id)] = bucket
+            self._session_agents = rebuilt
+
+    async def create(self, session_id: str, state: SubAgentState) -> SubAgentState:
+        async with self._lock:
+            self._session_agents.setdefault(session_id, {})[state.agent_id] = state
+            await self._persist_locked()
+            return copy.deepcopy(state)
+
+    async def get(self, session_id: str, agent_id: str) -> SubAgentState | None:
+        async with self._lock:
+            state = self._session_agents.get(session_id, {}).get(agent_id)
+            return copy.deepcopy(state) if state else None
+
+    async def count(self, session_id: str) -> int:
+        async with self._lock:
+            return len(self._session_agents.get(session_id, {}))
+
+    async def update_tools(
+        self, session_id: str, agent_id: str, allowed_tools: list[str]
+    ) -> SubAgentState | None:
+        async with self._lock:
+            state = self._session_agents.get(session_id, {}).get(agent_id)
+            if not state:
+                return None
+            state.allowed_tools = list(allowed_tools)
+            await self._persist_locked()
+            return copy.deepcopy(state)
+
+    async def update_contexts(
+        self, session_id: str, agent_id: str, contexts: list[dict[str, Any]]
+    ) -> bool:
+        async with self._lock:
+            state = self._session_agents.get(session_id, {}).get(agent_id)
+            if not state:
+                return False
+            # 滚动截断，防止上下文无限增长
+            if len(contexts) > _MAX_CONTEXT_TURNS * 2:
+                contexts = contexts[-(  _MAX_CONTEXT_TURNS * 2):]
+            state.contexts = copy.deepcopy(contexts)
+            await self._persist_locked()
+            return True
+
+    async def remove(self, session_id: str, agent_id: str) -> SubAgentState | None:
+        async with self._lock:
+            agents = self._session_agents.get(session_id, {})
+            removed = agents.pop(agent_id, None)
+            if not agents and session_id in self._session_agents:
+                self._session_agents.pop(session_id, None)
+            await self._persist_locked()
+            return copy.deepcopy(removed) if removed else None
+
+    async def cleanup_session(self, session_id: str) -> int:
+        async with self._lock:
+            removed = len(self._session_agents.get(session_id, {}))
+            self._session_agents.pop(session_id, None)
+            await self._persist_locked()
+            return removed
+
+    async def cleanup_all(self) -> int:
+        async with self._lock:
+            removed = sum(len(agents) for agents in self._session_agents.values())
+            self._session_agents.clear()
+            await self._persist_locked()
+            return removed
+
+    async def list_agents(self, session_id: str) -> list[SubAgentState]:
+        async with self._lock:
+            agents = self._session_agents.get(session_id, {})
+            return [copy.deepcopy(s) for s in agents.values()]
+
+    async def update_state_fields(
+        self,
+        session_id: str,
+        agent_id: str,
+        **fields,
+    ) -> SubAgentState | None:
+        """更新 SubAgentState 的任意字段（除 agent_id）。"""
+        async with self._lock:
+            state = self._session_agents.get(session_id, {}).get(agent_id)
+            if not state:
+                return None
+            for key, value in fields.items():
+                if key != "agent_id" and hasattr(state, key):
+                    setattr(state, key, value)
+            await self._persist_locked()
+            return copy.deepcopy(state)
+
+    async def increment_message_count(self, session_id: str, agent_id: str) -> None:
+        async with self._lock:
+            state = self._session_agents.get(session_id, {}).get(agent_id)
+            if state:
+                state.message_count += 1
+                await self._persist_locked()
+
+
+class Main(Star):
+    def __init__(self, context: Context, config: dict[str, Any] | None = None) -> None:
+        super().__init__(context, config)
+        self._config = config or {}
+        self.registry = SubAgentRegistry(self._persist_registry)
+        self._session_callback_registered = False
+        self.max_subagents_per_session = self._get_int_config(
+            "max_subagents_per_session", 10, minimum=1,
+        )
+        self.default_system_prompt = str(
+            self._config.get("default_system_prompt", ""),
+        ).strip()
+        self.auto_cleanup_on_unload = self._get_bool_config(
+            "auto_cleanup_on_unload", True,
+        )
+        self.enable_persistence = self._get_bool_config(
+            "enable_persistence", True,
+        )
+        # 每个子代理单次执行的超时秒数（0=不限）
+        self.subagent_timeout: int = self._get_int_config("subagent_timeout", 120, minimum=10)
+        # broadcast 并发度（0=全并行，>0=限制同时数量）
+        self.broadcast_concurrency: int = self._get_int_config("broadcast_concurrency", 0, minimum=0)
+
+    def _get_int_config(self, key: str, default: int, minimum: int | None = None) -> int:
+        value = self._config.get(key, default)
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = default
+        if minimum is not None and parsed < minimum:
+            return default
+        return parsed
+
+    def _get_bool_config(self, key: str, default: bool) -> bool:
+        value = self._config.get(key, default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"true", "1", "yes", "on"}:
+                return True
+            if lowered in {"false", "0", "no", "off"}:
+                return False
+        return default
+
+    async def initialize(self) -> None:
+        if self.enable_persistence:
+            data = await self.get_kv_data("subagent_registry", {})
+            if isinstance(data, dict):
+                await self.registry.load(data)
+        if not self._session_callback_registered:
+            self.context.conversation_manager.register_on_session_deleted(
+                self._on_session_deleted
+            )
+            self._session_callback_registered = True
+
+    async def terminate(self) -> None:
+        if not self.auto_cleanup_on_unload:
+            logger.info("subagent_manager terminated, skipped cleanup by config")
+            return
+        removed = await self.registry.cleanup_all()
+        logger.info("subagent_manager terminated, cleaned %s subagents", removed)
+
+    async def _persist_registry(self, snapshot: dict[str, Any]) -> None:
+        if not self.enable_persistence:
+            return
+        await self.put_kv_data("subagent_registry", snapshot)
+
+    async def _on_session_deleted(self, unified_msg_origin: str) -> None:
+        removed = await self.registry.cleanup_session(unified_msg_origin)
+        if removed > 0:
+            logger.info(
+                "subagent_manager cleaned %s subagents for deleted session %s",
+                removed,
+                unified_msg_origin,
+            )
+
+    def _collect_all_active_tool_names(self, include_orchestrator: bool = False) -> list[str]:
+        """快照当前所有活跃工具。
+        include_orchestrator=False 时过滤掉所有子代理管理工具（普通子代理）。
+        include_orchestrator=True  时保留编排者工具，仅屏蔽 init_subagent。
+        """
+        tool_mgr = self.context.get_llm_tool_manager()
+        result = []
+        for tool in tool_mgr.func_list:
+            if not getattr(tool, "active", True):
+                continue
+            if tool.name in _HARD_BLOCKED_TOOL_NAMES:
+                continue
+            if not include_orchestrator and tool.name in _ORCHESTRATOR_TOOL_NAMES:
+                continue
+            result.append(tool.name)
+        return result
+
+    def _validate_and_filter_tool_names(
+        self, tool_names: list[str], allow_orchestrator: bool = False
+    ) -> tuple[list[str], list[str]]:
+        """验证工具名是否存在且活跃，返回 (valid_names, invalid_names)。
+        allow_orchestrator: True 时允许编排者工具通过，False 时也会过滤。
+        """
+        tool_mgr = self.context.get_llm_tool_manager()
+        valid: list[str] = []
+        invalid: list[str] = []
+        seen: set[str] = set()
+        for name in tool_names:
+            tool_name = str(name).strip()
+            if not tool_name or tool_name in seen:
+                continue
+            seen.add(tool_name)
+            if tool_name in _HARD_BLOCKED_TOOL_NAMES:
+                invalid.append(f"{tool_name} (forbidden: only main agent can create subagents)")
+                continue
+            if not allow_orchestrator and tool_name in _ORCHESTRATOR_TOOL_NAMES:
+                # 普通子代理不允许拥有编排工具，如果明确传入则警告
+                invalid.append(f"{tool_name} (requires is_orchestrator=true)")
+                continue
+            tool = tool_mgr.get_func(tool_name)
+            if tool is None:
+                invalid.append(f"{tool_name} (not found)")
+                continue
+            if not getattr(tool, "active", True):
+                invalid.append(f"{tool_name} (inactive)")
+                continue
+            valid.append(tool_name)
+        return valid, invalid
+
+    def _build_toolset(self, allowed_tools: list[str]) -> ToolSet | None:
+        """根据已验证的工具名列表构建 ToolSet，跳过无效工具并记录警告。"""
+        tool_mgr = self.context.get_llm_tool_manager()
+        tool_set = ToolSet()
+        for tool_name in allowed_tools:
+            if tool_name in _HARD_BLOCKED_TOOL_NAMES:
+                logger.warning("subagent_manager: skipping hard-blocked tool %s", tool_name)
+                continue
+            tool = tool_mgr.get_func(tool_name)
+            if tool is None:
+                logger.warning("subagent_manager: tool %s not found, skipping", tool_name)
+                continue
+            if not getattr(tool, "active", True):
+                logger.warning("subagent_manager: tool %s inactive, skipping", tool_name)
+                continue
+            tool_set.add_tool(tool)
+        return None if tool_set.empty() else tool_set
+
+    async def _run_subagent_with_tool_loop(
+        self,
+        event: AstrMessageEvent,
+        state: SubAgentState,
+        message: str,
+        target_session_id: str,
+    ) -> str:
+        """使用完整的 ToolLoopAgentRunner 执行子代理，支持多轮工具调用。"""
+        provider = self.context.get_using_provider(event.unified_msg_origin)
+        if provider is None:
+            raise ValueError("no provider available")
+
+        tool_set = self._build_toolset(state.allowed_tools)
+
+        # 构建 ProviderRequest
+        req = ProviderRequest()
+        req.prompt = message
+        req.session_id = f"subagent:{target_session_id}:{state.agent_id}"
+        req.func_tool = tool_set
+        req.contexts = copy.deepcopy(state.contexts)
+        req.system_prompt = state.system_prompt or ""
+
+        # 构建子代理独立的 AstrAgentContext
+        astr_ctx = AstrAgentContext(
+            context=self.context,
+            event=event,
+        )
+        run_ctx = AgentContextWrapper(
+            context=astr_ctx,
+            tool_call_timeout=60,
+        )
+
+        agent_runner = AgentRunner()
+        await agent_runner.reset(
+            provider=provider,
+            request=req,
+            run_context=run_ctx,
+            tool_executor=FunctionToolExecutor(),
+            agent_hooks=MAIN_AGENT_HOOKS,
+            streaming=False,
+        )
+
+        # 带超时保护的 tool loop
+        async def _inner_run() -> str:
+            err_text_inner: str | None = None
+            parts: list[str] = []
+            async for resp in agent_runner.step_until_done(max_step=20):
+                if resp.type == "err":
+                    chain = resp.data.get("chain")
+                    err_text_inner = (
+                        chain.get_plain_text(with_other_comps_mark=False)
+                        if chain else "subagent LLM error"
+                    )
+                elif resp.type == "llm_result":
+                    chain = resp.data.get("chain")
+                    if chain:
+                        txt = chain.get_plain_text(with_other_comps_mark=False)
+                        if txt:
+                            parts.append(txt)
+
+            if err_text_inner:
+                raise RuntimeError(f"subagent LLM error: {err_text_inner}")
+
+            if parts:
+                inner_reply = "".join(parts)
+            else:
+                final_resp = agent_runner.get_final_llm_resp()
+                inner_reply = (final_resp.completion_text or "") if final_resp else ""
+
+            # 持久化对话上下文
+            new_contexts: list[dict[str, Any]] = []
+            for msg in agent_runner.run_context.messages:
+                if hasattr(msg, "model_dump"):
+                    d = msg.model_dump()
+                elif isinstance(msg, dict):
+                    d = copy.deepcopy(msg)
+                else:
+                    continue
+                if d.get("role") == "system":
+                    continue
+                new_contexts.append(d)
+
+            await self.registry.update_contexts(target_session_id, state.agent_id, new_contexts)
+            return inner_reply
+
+        try:
+            reply = await asyncio.wait_for(_inner_run(), timeout=self.subagent_timeout)
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"subagent {state.agent_id!r} timed out after {self.subagent_timeout}s"
+            )
+        return reply
+
+    # ------------------------------------------------------------------ #
+    #  LLM Tool: init_subagent
+    # ------------------------------------------------------------------ #
+    @filter.llm_tool("init_subagent")
+    async def init_subagent(
+        self,
+        event: AstrMessageEvent,
+        display_name: str = "",
+        system_prompt: str = "",
+        allowed_tools: list[str] | None = None,
+        role: str = "",
+        is_orchestrator: bool = False,
+        session_id: str = "",
+    ) -> str:
+        """Create a subagent with explicit tool snapshot.
+
+        Args:
+            display_name(string): Optional display name only for readability.
+            system_prompt(string): Optional system prompt for this subagent.
+            allowed_tools(list[string]): Optional allowed tools. Empty means all active tools snapshot.
+            role(string): Optional role label for this subagent, e.g. "researcher", "coder", "writer".
+            is_orchestrator(boolean): If true, this subagent can also call send_subagent_message / send_inter_agent_message / list_subagents etc. to coordinate other subagents.
+            session_id(string): Optional target session id. Empty uses current event session.
+        """
+        target_session_id = session_id.strip() or event.unified_msg_origin
+        current_count = await self.registry.count(target_session_id)
+        if current_count >= self.max_subagents_per_session:
+            raise ValueError(
+                f"max subagents reached for session: {self.max_subagents_per_session}"
+            )
+
+        if allowed_tools:
+            valid_tools, invalid_tools = self._validate_and_filter_tool_names(
+                allowed_tools, allow_orchestrator=is_orchestrator
+            )
+            if invalid_tools:
+                logger.warning(
+                    "subagent_manager: init_subagent ignored invalid tools: %s",
+                    invalid_tools,
+                )
+        else:
+            valid_tools = self._collect_all_active_tool_names(include_orchestrator=is_orchestrator)
+            invalid_tools = []
+
+        agent_id = str(uuid.uuid4())
+        state = SubAgentState(
+            agent_id=agent_id,
+            display_name=display_name.strip() or f"subagent-{agent_id[:8]}",
+            system_prompt=system_prompt.strip() or self.default_system_prompt,
+            allowed_tools=valid_tools,
+            role=role.strip(),
+            is_orchestrator=is_orchestrator,
+        )
+        await self.registry.create(target_session_id, state)
+        logger.info(
+            "subagent_manager: created %s (orchestrator=%s) tools=%s",
+            state.display_name, is_orchestrator, len(valid_tools),
+        )
+
+        result: dict[str, Any] = {
+            "ok": True,
+            "agent_id": agent_id,
+            "display_name": state.display_name,
+            "session_id": target_session_id,
+            "role": state.role,
+            "is_orchestrator": is_orchestrator,
+            "allowed_tools": valid_tools,
+        }
+        if invalid_tools:
+            result["warnings"] = invalid_tools
+        return json.dumps(result, ensure_ascii=False)
+
+    # ------------------------------------------------------------------ #
+    #  LLM Tool: send_subagent_message
+    # ------------------------------------------------------------------ #
+    @filter.llm_tool("send_subagent_message")
+    async def send_subagent_message(
+        self,
+        event: AstrMessageEvent,
+        agent_id: str,
+        message: str,
+        session_id: str = "",
+    ) -> str:
+        """Send a message to a subagent and return reply text.
+        The subagent will autonomously call tools and reason through multi-step tasks.
+
+        Args:
+            agent_id(string): Stable subagent id returned by init_subagent.
+            message(string): User message for this subagent.
+            session_id(string): Optional target session id. Empty uses current event session.
+        """
+        target_session_id = session_id.strip() or event.unified_msg_origin
+        state = await self.registry.get(target_session_id, agent_id.strip())
+        if not state:
+            raise ValueError("subagent not found")
+
+        reply = await self._run_subagent_with_tool_loop(
+            event=event,
+            state=state,
+            message=message,
+            target_session_id=target_session_id,
+        )
+
+        await self.registry.increment_message_count(target_session_id, state.agent_id)
+        updated_state = await self.registry.get(target_session_id, state.agent_id)
+        msg_count = updated_state.message_count if updated_state else state.message_count + 1
+
+        return json.dumps(
+            {
+                "ok": True,
+                "agent_id": state.agent_id,
+                "display_name": state.display_name,
+                "session_id": target_session_id,
+                "reply": reply,
+                "message_count": msg_count,
+            },
+            ensure_ascii=False,
+        )
+
+    # ------------------------------------------------------------------ #
+    #  LLM Tool: send_inter_agent_message
+    # ------------------------------------------------------------------ #
+    @filter.llm_tool("send_inter_agent_message")
+    async def send_inter_agent_message(
+        self,
+        event: AstrMessageEvent,
+        from_agent_id: str,
+        to_agent_id: str,
+        message: str,
+        session_id: str = "",
+    ) -> str:
+        """Send a message from one subagent to another subagent within the same session.
+        Enables peer-to-peer communication between specialized subagents.
+
+        Args:
+            from_agent_id(string): The sender subagent id (for audit/logging only).
+            to_agent_id(string): The recipient subagent id.
+            message(string): The message content to deliver to the target subagent.
+            session_id(string): Optional target session id. Empty uses current event session.
+        """
+        target_session_id = session_id.strip() or event.unified_msg_origin
+        from_state = await self.registry.get(target_session_id, from_agent_id.strip())
+        if not from_state:
+            raise ValueError(f"sender subagent not found: {from_agent_id}")
+        to_state = await self.registry.get(target_session_id, to_agent_id.strip())
+        if not to_state:
+            raise ValueError(f"recipient subagent not found: {to_agent_id}")
+
+        stamped = (
+            f"[Message from subagent '{from_state.display_name}' "
+            f"(id={from_state.agent_id[:8]})]\n{message}"
+        )
+        reply = await self._run_subagent_with_tool_loop(
+            event=event, state=to_state, message=stamped,
+            target_session_id=target_session_id,
+        )
+        await self.registry.increment_message_count(target_session_id, to_state.agent_id)
+        logger.info(
+            "subagent_manager: inter-agent msg %s -> %s",
+            from_agent_id[:8], to_agent_id[:8],
+        )
+
+        return json.dumps(
+            {
+                "ok": True,
+                "from_agent_id": from_state.agent_id,
+                "from_display_name": from_state.display_name,
+                "to_agent_id": to_state.agent_id,
+                "to_display_name": to_state.display_name,
+                "session_id": target_session_id,
+                "reply": reply,
+            },
+            ensure_ascii=False,
+        )
+
+    # ------------------------------------------------------------------ #
+    #  LLM Tool: update_subagent_tools
+    # ------------------------------------------------------------------ #
+    @filter.llm_tool("update_subagent_tools")
+    async def update_subagent_tools(
+        self,
+        event: AstrMessageEvent,
+        agent_id: str,
+        allowed_tools: list[str],
+        session_id: str = "",
+    ) -> str:
+        """Update allowed tools of a subagent with existence validation.
+
+        Args:
+            agent_id(string): Stable subagent id returned by init_subagent.
+            allowed_tools(list[string]): New explicit allowed tool names.
+            session_id(string): Optional target session id. Empty uses current event session.
+        """
+        target_session_id = session_id.strip() or event.unified_msg_origin
+        state = await self.registry.get(target_session_id, agent_id.strip())
+        if not state:
+            raise ValueError("subagent not found")
+
+        valid_tools, invalid_tools = self._validate_and_filter_tool_names(
+            allowed_tools, allow_orchestrator=state.is_orchestrator
+        )
+        if invalid_tools:
+            logger.warning(
+                "subagent_manager: update_subagent_tools ignored invalid tools: %s",
+                invalid_tools,
+            )
+
+        updated = await self.registry.update_tools(
+            target_session_id,
+            agent_id.strip(),
+            valid_tools,
+        )
+        if not updated:
+            raise ValueError("subagent not found")
+
+        result: dict[str, Any] = {
+            "ok": True,
+            "agent_id": updated.agent_id,
+            "session_id": target_session_id,
+            "allowed_tools": updated.allowed_tools,
+        }
+        if invalid_tools:
+            result["warnings"] = invalid_tools
+        return json.dumps(result, ensure_ascii=False)
+
+    # ------------------------------------------------------------------ #
+    #  LLM Tool: close_subagent
+    # ------------------------------------------------------------------ #
+    @filter.llm_tool("close_subagent")
+    async def close_subagent(
+        self,
+        event: AstrMessageEvent,
+        agent_id: str,
+        session_id: str = "",
+    ) -> str:
+        """Close and cleanup a subagent.
+
+        Args:
+            agent_id(string): Stable subagent id returned by init_subagent.
+            session_id(string): Optional target session id. Empty uses current event session.
+        """
+        target_session_id = session_id.strip() or event.unified_msg_origin
+        removed = await self.registry.remove(target_session_id, agent_id.strip())
+        if not removed:
+            raise ValueError("subagent not found")
+        return json.dumps(
+            {
+                "ok": True,
+                "agent_id": removed.agent_id,
+                "display_name": removed.display_name,
+                "session_id": target_session_id,
+            },
+            ensure_ascii=False,
+        )
+
+    # ------------------------------------------------------------------ #
+    #  LLM Tool: list_subagents
+    # ------------------------------------------------------------------ #
+    @filter.llm_tool("list_subagents")
+    async def list_subagents(
+        self,
+        event: AstrMessageEvent,
+        session_id: str = "",
+        role_filter: str = "",
+    ) -> str:
+        """List all active subagents in a session, showing their id, role, tools, and message count.
+
+        Args:
+            session_id(string): Optional target session id. Empty uses current event session.
+            role_filter(string): Optional role label to filter agents, e.g. "researcher".
+        """
+        target_session_id = session_id.strip() or event.unified_msg_origin
+        agents = await self.registry.list_agents(target_session_id)
+        if role_filter.strip():
+            agents = [a for a in agents if a.role == role_filter.strip()]
+        return json.dumps(
+            {
+                "ok": True,
+                "session_id": target_session_id,
+                "count": len(agents),
+                "agents": [a.to_summary_dict() for a in agents],
+            },
+            ensure_ascii=False,
+        )
+
+    # ------------------------------------------------------------------ #
+    #  LLM Tool: update_subagent_metadata
+    # ------------------------------------------------------------------ #
+    @filter.llm_tool("update_subagent_metadata")
+    async def update_subagent_metadata(
+        self,
+        event: AstrMessageEvent,
+        agent_id: str,
+        metadata: dict | None = None,
+        display_name: str = "",
+        role: str = "",
+        session_id: str = "",
+    ) -> str:
+        """Update metadata, display_name, or role of an existing subagent.
+
+        Args:
+            agent_id(string): Stable subagent id returned by init_subagent.
+            metadata(object): Optional arbitrary key-value metadata to merge into the subagent.
+            display_name(string): Optional new display name.
+            role(string): Optional new role label.
+            session_id(string): Optional target session id. Empty uses current event session.
+        """
+        target_session_id = session_id.strip() or event.unified_msg_origin
+        state = await self.registry.get(target_session_id, agent_id.strip())
+        if not state:
+            raise ValueError("subagent not found")
+
+        fields: dict[str, Any] = {}
+        if display_name.strip():
+            fields["display_name"] = display_name.strip()
+        if role.strip():
+            fields["role"] = role.strip()
+        if metadata:
+            merged = dict(state.metadata)
+            merged.update(metadata)
+            fields["metadata"] = merged
+
+        if fields:
+            updated = await self.registry.update_state_fields(
+                target_session_id, agent_id.strip(), **fields
+            )
+        else:
+            updated = state
+
+        return json.dumps(
+            {
+                "ok": True,
+                "agent_id": updated.agent_id if updated else agent_id,
+                "updated_fields": list(fields.keys()),
+            },
+            ensure_ascii=False,
+        )
+
+    # ------------------------------------------------------------------ #
+    #  LLM Tool: broadcast_subagent_message
+    # ------------------------------------------------------------------ #
+    @filter.llm_tool("broadcast_subagent_message")
+    async def broadcast_subagent_message(
+        self,
+        event: AstrMessageEvent,
+        message: str,
+        role_filter: str = "",
+        session_id: str = "",
+    ) -> str:
+        """Send the same message to ALL subagents in a session (optionally filtered by role) and collect all replies.
+
+        Useful for orchestrator patterns: fan-out a task to a team of specialized agents.
+
+        Args:
+            message(string): The message to broadcast to every subagent.
+            role_filter(string): Optional role label — if set, only subagents with that role receive the message.
+            session_id(string): Optional target session id. Empty uses current event session.
+        """
+        target_session_id = session_id.strip() or event.unified_msg_origin
+        agents = await self.registry.list_agents(target_session_id)
+        if not agents:
+            return json.dumps(
+                {"ok": True, "session_id": target_session_id, "results": []},
+                ensure_ascii=False,
+            )
+
+        if role_filter.strip():
+            agents = [a for a in agents if a.role == role_filter.strip()]
+
+        async def _dispatch(st: SubAgentState):
+            try:
+                reply = await self._run_subagent_with_tool_loop(
+                    event=event, state=st, message=message,
+                    target_session_id=target_session_id,
+                )
+                await self.registry.increment_message_count(target_session_id, st.agent_id)
+                return {
+                    "agent_id": st.agent_id, "display_name": st.display_name,
+                    "role": st.role, "ok": True, "reply": reply,
+                }
+            except Exception as exc:
+                return {
+                    "agent_id": st.agent_id, "display_name": st.display_name,
+                    "role": st.role, "ok": False, "error": str(exc),
+                }
+
+        concurrency = self.broadcast_concurrency
+        if concurrency <= 0 or concurrency >= len(agents):
+            results = list(await asyncio.gather(*[_dispatch(s) for s in agents]))
+        else:
+            sem = asyncio.Semaphore(concurrency)
+
+            async def _guarded(s: SubAgentState):
+                async with sem:
+                    return await _dispatch(s)
+
+            results = list(await asyncio.gather(*[_guarded(s) for s in agents]))
+
+        return json.dumps(
+            {
+                "ok": True,
+                "session_id": target_session_id,
+                "broadcast_count": len(results),
+                "results": results,
+            },
+            ensure_ascii=False,
+        )

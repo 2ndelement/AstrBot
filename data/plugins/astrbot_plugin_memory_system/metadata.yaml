@@ -1,0 +1,5 @@
+name: astrbot_plugin_memory_system
+desc: 三层记忆系统 — 自动注入长期/中期/短期记忆上下文，提供日记写入与记忆提炼 LLM 工具
+version: 1.0.0
+author: Patori
+repo: ""

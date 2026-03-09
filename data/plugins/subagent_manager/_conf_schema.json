@@ -1,0 +1,54 @@
+{
+    "max_subagents_per_session": {
+        "description": "单会话最大子代理数量",
+        "type": "int",
+        "default": 10,
+        "hint": "超过该数量后将拒绝继续创建子代理"
+    },
+    "default_system_prompt": {
+        "description": "默认系统提示词",
+        "type": "string",
+        "default": "",
+        "hint": "创建子代理时未传 system_prompt 则使用该值"
+    },
+    "auto_cleanup_on_unload": {
+        "description": "插件卸载时自动清理子代理",
+        "type": "bool",
+        "default": true
+    },
+    "enable_persistence": {
+        "description": "启用子代理状态持久化",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后不会读取或写入 subagent_registry 数据"
+    },
+    "subagent_timeout": {
+        "description": "每个子代理单次执行的超时秒数",
+        "type": "int",
+        "default": 120,
+        "hint": "最小 10 秒；子代理超时将抛出错误"
+    },
+    "broadcast_concurrency": {
+        "description": "broadcast 并发度（0=全并行，>0=限制同时执行数量）",
+        "type": "int",
+        "default": 0
+    },
+    "subagent_exec_timeout": {
+        "description": "subagent_shell_exec / subagent_python_exec 单次执行超时秒数",
+        "type": "int",
+        "default": 30,
+        "hint": "最小 5 秒；适用于子代理专用命令/代码执行工具"
+    },
+    "subagent_provider": {
+        "description": "子代理运行时使用的 provider name（ID）",
+        "type": "string",
+        "default": "",
+        "hint": "留空则跟随 session 默认 provider；填写 provider ID 后，所有子代理将使用该 provider 运行"
+    },
+    "subagent_max_step": {
+        "description": "子代理单次执行的最大工具调用步数（max_step）",
+        "type": "int",
+        "default": 50,
+        "hint": "最小 1；控制子代理 tool loop 的最大循环次数，防止无限循环"
+    }
+}
