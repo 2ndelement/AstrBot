@@ -61,3 +61,6 @@ GenieData/
 .codex/
 .opencode/
 .kilocode/
+
+# Ignore local plugins (not part of upstream source)
+data/plugins/

@@ -1,8 +1,0 @@
-name: astrbot_plugin_task_control
-display_name: 任务控制
-description: >
-  增强版 Shell 工具：让 LLM 自由指定执行超时（支持下载、安装等长时任务），
-  并提供 /stop 命令强制终止所有正在运行的 Shell 命令并拦截后续工具调用。
-version: "1.0.0"
-author: Copilot
-repo: ""
