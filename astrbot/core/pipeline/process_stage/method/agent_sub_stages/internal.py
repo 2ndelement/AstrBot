@@ -144,8 +144,6 @@ class InternalAgentSubStage(Stage):
         follow_up_capture: FollowUpCapture | None = None
         follow_up_consumed_marked = False
         follow_up_activated = False
-        agent_runner: AgentRunner | None = None
-        req: ProviderRequest | None = None
         try:
             streaming_response = self.streaming_response
             if (enable_streaming := event.get_extra("enable_streaming")) is not None:
@@ -185,33 +183,7 @@ class InternalAgentSubStage(Stage):
 
             async with session_lock_manager.acquire_lock(event.unified_msg_origin):
                 logger.debug("acquired session lock for llm request")
-
-                # Re-attempt follow-up capture after acquiring the lock.
-                # This handles the race condition where a follow-up message arrives
-                # *before* the active runner is registered (i.e., during build_main_agent).
-                # After lock acquisition the previous runner is guaranteed to be done,
-                # so if an active runner is present now it must be a concurrently-registered
-                # one on a *different* coroutine, which means we should still try to attach.
-                if follow_up_capture is None:
-                    follow_up_capture_retry = try_capture_follow_up(event)
-                    if follow_up_capture_retry is not None:
-                        logger.info(
-                            "Late follow-up capture after lock, umo=%s",
-                            event.unified_msg_origin,
-                        )
-                        follow_up_capture = follow_up_capture_retry
-                        (
-                            follow_up_consumed_marked,
-                            follow_up_activated,
-                        ) = await prepare_follow_up_capture(follow_up_capture)
-                        if follow_up_consumed_marked:
-                            logger.info(
-                                "Late follow-up ticket already consumed, stopping. umo=%s",
-                                event.unified_msg_origin,
-                            )
-                            return
-
-                agent_runner = None
+                agent_runner: AgentRunner | None = None
                 runner_registered = False
                 try:
                     build_cfg = replace(
@@ -308,13 +280,16 @@ class InternalAgentSubStage(Stage):
                         yield
 
                         # 保存历史记录
-                        if agent_runner.done() and self._should_persist_history(
-                            event, agent_runner
+                        if agent_runner.done() and (
+                            not event.is_stopped() or agent_runner.was_aborted()
                         ):
-                            await self._save_runner_history(
+                            await self._save_to_history(
                                 event,
                                 req,
-                                agent_runner,
+                                agent_runner.get_final_llm_resp(),
+                                agent_runner.run_context.messages,
+                                agent_runner.stats,
+                                user_aborted=agent_runner.was_aborted(),
                             )
 
                     elif streaming_response and not stream_to_general:
@@ -371,12 +346,14 @@ class InternalAgentSubStage(Stage):
                     )
 
                     # 检查事件是否被停止，如果被停止则不保存历史记录
-                    if self._should_persist_history(event, agent_runner):
-                        await self._save_runner_history(
+                    if not event.is_stopped() or agent_runner.was_aborted():
+                        await self._save_to_history(
                             event,
                             req,
-                            agent_runner,
-                            llm_response=final_resp,
+                            final_resp,
+                            agent_runner.run_context.messages,
+                            agent_runner.stats,
+                            user_aborted=agent_runner.was_aborted(),
                         )
 
                     asyncio.create_task(
@@ -391,19 +368,7 @@ class InternalAgentSubStage(Stage):
                         unregister_active_runner(event.unified_msg_origin, agent_runner)
 
         except Exception as e:
-            logger.error(f"Error occurred while processing agent: {e}", exc_info=True)
-            # 尝试保存已有的会话上下文，防止请求失败后上下文丢失
-            try:
-                if self._can_save_partial_history(agent_runner, req):
-                    await self._save_runner_history(
-                        event,
-                        req,
-                        agent_runner,
-                        user_aborted=False,
-                    )
-                    logger.info("请求失败，已保存已有上下文以防止历史丢失。")
-            except Exception as save_err:
-                logger.warning(f"保存上下文时出错（非致命）: {save_err}")
+            logger.error(f"Error occurred while processing agent: {e}")
             custom_error_message = extract_persona_custom_error_message_from_event(
                 event
             )
@@ -418,41 +383,6 @@ class InternalAgentSubStage(Stage):
                     activated=follow_up_activated,
                     consumed_marked=follow_up_consumed_marked,
                 )
-
-    @staticmethod
-    def _should_persist_history(
-        event: AstrMessageEvent, agent_runner: AgentRunner
-    ) -> bool:
-        return (not event.is_stopped()) or agent_runner.was_aborted()
-
-    @staticmethod
-    def _can_save_partial_history(
-        agent_runner: AgentRunner | None, req: ProviderRequest | None
-    ) -> bool:
-        return bool(
-            agent_runner is not None
-            and req is not None
-            and agent_runner.run_context.messages
-        )
-
-    async def _save_runner_history(
-        self,
-        event: AstrMessageEvent,
-        req: ProviderRequest,
-        agent_runner: AgentRunner,
-        llm_response: LLMResponse | None = None,
-        user_aborted: bool | None = None,
-    ) -> None:
-        if user_aborted is None:
-            user_aborted = agent_runner.was_aborted()
-        await self._save_to_history(
-            event,
-            req,
-            llm_response if llm_response is not None else agent_runner.get_final_llm_resp(),
-            agent_runner.run_context.messages,
-            agent_runner.stats,
-            user_aborted=user_aborted,
-        )
 
     async def _save_to_history(
         self,
@@ -470,7 +400,7 @@ class InternalAgentSubStage(Stage):
             return
 
         if llm_response and llm_response.role != "assistant":
-            if not user_aborted and llm_response.role != "err":
+            if not user_aborted:
                 return
             llm_response = LLMResponse(
                 role="assistant",
