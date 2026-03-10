@@ -87,6 +87,39 @@ def _build_tool_result_status_message(
     return status_msg
 
 
+def _normalize_for_compare(text: str) -> str:
+    text = text.strip().lower()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def _extract_plain_from_components(chain: list[BaseMessageComponent]) -> str:
+    return "".join(
+        comp.text for comp in chain if isinstance(comp, Plain) and comp.text
+    )
+
+
+def _should_suppress_llm_result_due_to_proactive_send(
+    astr_event,
+    resp_chain: MessageChain,
+) -> bool:
+    # only suppress pure plain-text llm_result
+    if not resp_chain.chain:
+        return False
+    if not all(isinstance(comp, Plain) for comp in resp_chain.chain):
+        return False
+
+    proactive_text = astr_event.get_extra("_send_message_to_user_last_plain_text", "")
+    if not isinstance(proactive_text, str) or not proactive_text.strip():
+        return False
+
+    llm_text = _extract_plain_from_components(resp_chain.chain)
+    if not llm_text.strip():
+        return False
+
+    return _normalize_for_compare(proactive_text) == _normalize_for_compare(llm_text)
+
+
 async def run_agent(
     agent_runner: AgentRunner,
     max_step: int = 30,
@@ -197,6 +230,16 @@ async def run_agent(
                         if resp.type == "llm_result"
                         else ResultContentType.GENERAL_RESULT
                     )
+                    if (
+                        resp.type == "llm_result"
+                        and _should_suppress_llm_result_due_to_proactive_send(
+                            astr_event, resp.data["chain"]
+                        )
+                    ):
+                        logger.info(
+                            "Suppress duplicated llm_result after send_message_to_user in same turn."
+                        )
+                        continue
                     astr_event.set_result(
                         MessageEventResult(
                             chain=resp.data["chain"].chain,

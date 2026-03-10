@@ -288,7 +288,7 @@ class QQOfficialPlatformAdapter(Platform):
                     return
 
             else:
-                payload["markdown"] = MarkdownPayload(content=plain_text)
+                payload["markdown"] = {"content": plain_text}
                 payload["msg_type"] = 2
 
             route = Route("POST", "/v2/users/{openid}/messages", openid=openid)

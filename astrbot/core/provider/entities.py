@@ -11,6 +11,9 @@ from google.genai.types import GenerateContentResponse
 from openai.types.chat.chat_completion import ChatCompletion
 
 import astrbot.core.message.components as Comp
+
+LLM_CONTROL_CODE_EMPTY_COMPLETION_RETRY = "EMPTY_COMPLETION_RETRY"
+LLM_CONTROL_CODE_UNKNOWN_TOOL_CALL = "UNKNOWN_TOOL_CALL"
 from astrbot import logger
 from astrbot.core.agent.message import (
     AssistantMessageSegment,
@@ -291,6 +294,12 @@ class LLMResponse:
     usage: TokenUsage | None = None
     """The usage of the response. For chunked responses, it's the usage of the chunk; for non-chunked responses, it's the usage of the response."""
 
+    control_code: str = ""
+    """Structured internal control code for runner/provider coordination.
+
+    Examples: LLM_CONTROL_CODE_EMPTY_COMPLETION_RETRY, LLM_CONTROL_CODE_UNKNOWN_TOOL_CALL
+    """
+
     def __init__(
         self,
         role: str,
@@ -309,6 +318,7 @@ class LLMResponse:
         is_chunk: bool = False,
         id: str | None = None,
         usage: TokenUsage | None = None,
+        control_code: str = "",
     ) -> None:
         """初始化 LLMResponse
 
@@ -348,6 +358,7 @@ class LLMResponse:
             self.id = id
         if usage is not None:
             self.usage = usage
+        self.control_code = control_code or ""
 
     @property
     def completion_text(self):

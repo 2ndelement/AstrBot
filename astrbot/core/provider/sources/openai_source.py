@@ -21,7 +21,13 @@ from astrbot.api.provider import Provider
 from astrbot.core.agent.message import ContentPart, ImageURLPart, Message, TextPart
 from astrbot.core.agent.tool import ToolSet
 from astrbot.core.message.message_event_result import MessageChain
-from astrbot.core.provider.entities import LLMResponse, TokenUsage, ToolCallsResult
+from astrbot.core.provider.entities import (
+    LLMResponse,
+    LLM_CONTROL_CODE_EMPTY_COMPLETION_RETRY,
+    LLM_CONTROL_CODE_UNKNOWN_TOOL_CALL,
+    TokenUsage,
+    ToolCallsResult,
+)
 from astrbot.core.utils.io import download_image_by_url
 from astrbot.core.utils.network_utils import (
     create_proxy_client,
@@ -67,6 +73,26 @@ class ProviderOpenAIOfficial(Provider):
                 if pattern:
                     patterns.append(pattern)
         return patterns
+
+    @staticmethod
+    def _build_unknown_tool_call_response(choice: Any, llm_response: LLMResponse) -> None:
+        tool_calls = choice.message.tool_calls
+        unknown_tools = [
+            tc.function.name for tc in tool_calls if hasattr(tc, "function")
+        ]
+        llm_response.role = "tool"
+        llm_response.tools_call_args = [{}] * len(tool_calls)
+        llm_response.tools_call_name = unknown_tools
+        llm_response.tools_call_ids = [
+            tc.id if hasattr(tc, "id") else f"unknown_{i}"
+            for i, tc in enumerate(tool_calls)
+        ]
+        llm_response.control_code = LLM_CONTROL_CODE_UNKNOWN_TOOL_CALL
+
+    @staticmethod
+    def _mark_empty_completion_retry(llm_response: LLMResponse) -> None:
+        llm_response.completion_text = ""
+        llm_response.control_code = LLM_CONTROL_CODE_EMPTY_COMPLETION_RETRY
 
     @staticmethod
     def _extract_error_text_candidates(error: Exception) -> list[str]:
@@ -352,7 +378,30 @@ class ProviderOpenAIOfficial(Provider):
             if _y:
                 yield llm_response
 
-        final_completion = state.get_final_completion()
+        try:
+            final_completion = state.get_final_completion()
+        except Exception as e:
+            logger.error(
+                "Failed to build final completion from stream state: %s",
+                e,
+                exc_info=True,
+            )
+            yield LLMResponse(
+                role="err",
+                completion_text=f"流式响应解析失败: {type(e).__name__}: {e}",
+            )
+            return
+
+        if not isinstance(final_completion, ChatCompletion):
+            yield LLMResponse(
+                role="err",
+                completion_text=(
+                    "流式响应最终结果无效："
+                    f"{type(final_completion).__name__}: {final_completion}"
+                ),
+            )
+            return
+
         llm_response = await self._parse_openai_completion(final_completion, tools)
 
         yield llm_response
@@ -562,7 +611,11 @@ class ProviderOpenAIOfficial(Provider):
             # "tool not found" feedback, then force completion_text to a stop message so the
             # runner transitions to DONE instead of looping indefinitely.
             if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
-                _unknown_tools = [tc.function.name for tc in choice.message.tool_calls if hasattr(tc, 'function')]
+                _unknown_tools = [
+                    tc.function.name
+                    for tc in choice.message.tool_calls
+                    if hasattr(tc, "function")
+                ]
                 logger.warning(
                     f"API returned finish_reason=tool_calls but no matching tool found in tools list. "
                     f"Tool calls returned: {_unknown_tools}. "
@@ -571,16 +624,7 @@ class ProviderOpenAIOfficial(Provider):
                 # Pass the unknown tool calls to the runner so it can inject proper tool-result
                 # messages into the context (telling the LLM the tools don't exist).
                 # Setting tools_call_name lets _handle_function_tools append the error results.
-                llm_response.role = "tool"
-                llm_response.tools_call_args = [{}] * len(choice.message.tool_calls)
-                llm_response.tools_call_name = _unknown_tools
-                llm_response.tools_call_ids = [
-                    tc.id if hasattr(tc, 'id') else f"unknown_{i}"
-                    for i, tc in enumerate(choice.message.tool_calls)
-                ]
-                # Mark as terminal: runner will still inject tool error results, but after that
-                # the agent should stop. We set a sentinel so the runner can detect this case.
-                llm_response.completion_text = "__UNKNOWN_TOOL_STOP__"
+                self._build_unknown_tool_call_response(choice, llm_response)
             else:
                 # Empty/unparseable completion (e.g. model returned content=None with finish_reason=stop)
                 # Return a special sentinel so the runner retries instead of crashing the tool chain
@@ -588,8 +632,7 @@ class ProviderOpenAIOfficial(Provider):
                     f"API returned unparseable completion (content=None, no tool_calls). "
                     f"Treating as empty response and retrying. completion: {completion}"
                 )
-                llm_response.completion_text = ""
-                llm_response.role = "err_retry"
+                self._mark_empty_completion_retry(llm_response)
 
         llm_response.raw_completion = completion
         llm_response.id = completion.id

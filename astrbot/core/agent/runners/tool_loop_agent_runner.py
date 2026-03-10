@@ -28,6 +28,8 @@ from astrbot.core.persona_error_reply import (
 )
 from astrbot.core.provider.entities import (
     LLMResponse,
+    LLM_CONTROL_CODE_EMPTY_COMPLETION_RETRY,
+    LLM_CONTROL_CODE_UNKNOWN_TOOL_CALL,
     ProviderRequest,
     ToolCallsResult,
 )
@@ -85,6 +87,14 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         """Read persona-level custom error message from event extras when available."""
         event = getattr(self.run_context.context, "event", None)
         return extract_persona_custom_error_message_from_event(event)
+
+    @staticmethod
+    def _is_empty_completion_retry(resp: LLMResponse) -> bool:
+        return resp.control_code == LLM_CONTROL_CODE_EMPTY_COMPLETION_RETRY
+
+    @staticmethod
+    def _is_unknown_tool_call(resp: LLMResponse) -> bool:
+        return resp.control_code == LLM_CONTROL_CODE_UNKNOWN_TOOL_CALL
 
     @override
     async def reset(
@@ -247,7 +257,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                         yield resp
                         continue
 
-                    if resp.role == "err_retry":
+                    if self._is_empty_completion_retry(resp):
                         # Empty/unparseable response from model, retry same provider once
                         logger.warning(
                             "Chat Model %s returned empty/unparseable completion, retrying once...",
@@ -284,8 +294,8 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                     return
             except Exception as exc:  # noqa: BLE001
                 last_exception = exc
-                # Auto-compress context when model_max_prompt_tokens_exceeded
                 _exc_str = str(exc).lower()
+                # Auto-compress context when model_max_prompt_tokens_exceeded
                 if (
                     "model_max_prompt_tokens_exceeded" in _exc_str
                     or "prompt token count" in _exc_str
@@ -630,12 +640,10 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             # We still run _handle_function_tools so tool-result error messages are
             # injected into the context, but afterwards we force the agent to DONE
             # only if this happens consecutively (to avoid false positives from param errors).
-            _is_unknown_tool_call = (
-                llm_resp.completion_text == "__UNKNOWN_TOOL_STOP__"
-            )
+            _is_unknown_tool_call = self._is_unknown_tool_call(llm_resp)
             if _is_unknown_tool_call:
                 self._unknown_tool_consecutive_count += 1
-                llm_resp.completion_text = ""  # clear sentinel before passing to handler
+                llm_resp.control_code = ""  # clear control code before passing to handler
             else:
                 self._unknown_tool_consecutive_count = 0
             # Only force DONE after 2+ consecutive unknown tool calls

@@ -1,6 +1,9 @@
+import ast
 import asyncio
+import hashlib
 import math
 import random
+import re
 from collections.abc import AsyncGenerator
 
 import astrbot.core.message.components as Comp
@@ -167,6 +170,118 @@ class RespondStage(Stage):
 
         return extracted
 
+    @staticmethod
+    def _normalize_text_for_dedupe(text: str) -> str:
+        text = text.strip().lower()
+        text = re.sub(r"\s+", " ", text)
+        return text
+
+    @staticmethod
+    def _extract_plain_text(chain: list[BaseMessageComponent]) -> str:
+        return "".join(
+            comp.text for comp in chain if isinstance(comp, Comp.Plain) and comp.text
+        )
+
+    @staticmethod
+    def _try_unwrap_tool_literal_text(text: str) -> str | None:
+        """Try to unwrap leaked tool-component literals like [{'type':'text','text':'...'}]."""
+        candidate = text.strip()
+        if not candidate:
+            return None
+        if not (candidate.startswith("[") or candidate.startswith("{")):
+            return None
+        if "type" not in candidate or "text" not in candidate:
+            return None
+
+        try:
+            parsed = ast.literal_eval(candidate)
+        except Exception:
+            return None
+
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+        if not isinstance(parsed, list):
+            return None
+
+        texts: list[str] = []
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("type", "")).lower() != "text":
+                continue
+            txt = item.get("text")
+            if isinstance(txt, str) and txt.strip():
+                texts.append(txt.strip())
+
+        if not texts:
+            return None
+
+        # 同回合常见重复：同一句被拼了两遍，这里顺手压一层
+        merged = "\n".join(texts)
+        if len(texts) == 2 and texts[0] == texts[1]:
+            return texts[0]
+        return merged
+
+    def _filter_internal_json_result(self, event: AstrMessageEvent, result) -> bool:
+        """Block internal tool json payloads from leaking to non-webchat users."""
+        if event.get_platform_name() == "webchat":
+            return False
+        if getattr(result, "type", None) not in {"tool_call", "tool_call_result", "agent_stats"}:
+            return False
+        if not result.chain:
+            return False
+        return all(isinstance(comp, Comp.Json) for comp in result.chain)
+
+    def _dedupe_plain_result(self, event: AstrMessageEvent, result) -> bool:
+        """Return True means should skip sending this result due to duplicate."""
+        chain = result.chain or []
+        if not chain:
+            return False
+
+        # 仅对纯文本链路去重，避免误伤带媒体的消息
+        if not all(isinstance(comp, Comp.Plain) for comp in chain):
+            return False
+
+        current_text = self._extract_plain_text(chain)
+        if not current_text.strip():
+            return False
+        current_norm = self._normalize_text_for_dedupe(current_text)
+        current_hash = hashlib.sha256(current_norm.encode("utf-8")).hexdigest()
+
+        # 如果本回合已用 send_message_to_user 发过同文案，则抑制复述
+        proactive_hash = event.get_extra("_send_message_to_user_last_plain_hash", "")
+        if isinstance(proactive_hash, str) and proactive_hash:
+            if proactive_hash == current_hash:
+                logger.info(
+                    "Skip duplicate assistant text: already sent via send_message_to_user in this turn."
+                )
+                return True
+
+        proactive_text = event.get_extra("_send_message_to_user_last_plain_text", "")
+        if isinstance(proactive_text, str) and proactive_text.strip():
+            proactive_norm = self._normalize_text_for_dedupe(proactive_text)
+            if proactive_norm == current_norm:
+                logger.info(
+                    "Skip duplicate assistant text: already sent via send_message_to_user in this turn."
+                )
+                return True
+
+        # 常规同回合去重（哈希闸门）
+        last_hash = event.get_extra("_last_sent_plain_hash", "")
+        if isinstance(last_hash, str) and last_hash == current_hash:
+            logger.info("Skip duplicate assistant text in same turn (hash gate).")
+            return True
+
+        # 常规同回合去重（规范化文本闸门）
+        last_norm = event.get_extra("_last_sent_plain_norm", "")
+        if isinstance(last_norm, str) and last_norm == current_norm:
+            logger.info("Skip duplicate assistant text in same turn.")
+            return True
+
+        event.set_extra("_last_sent_plain_hash", current_hash)
+        event.set_extra("_last_sent_plain_norm", current_norm)
+        return False
+
     async def process(
         self,
         event: AstrMessageEvent,
@@ -184,6 +299,24 @@ class RespondStage(Stage):
         logger.info(
             f"Prepare to send - {event.get_sender_name()}/{event.get_sender_id()}: {event._outline_chain(result.chain)}",
         )
+
+        # 屏蔽内部工具 JSON 消息对外泄漏（非 webchat）
+        if self._filter_internal_json_result(event, result):
+            logger.info("Filtered internal tool JSON result for non-webchat platform.")
+            event.clear_result()
+            return
+
+        # 清洗工具组件字面量泄漏：[{"type":"text",...}] -> 纯文本
+        if result.chain and all(isinstance(comp, Comp.Plain) for comp in result.chain):
+            raw_text = self._extract_plain_text(result.chain)
+            unwrapped = self._try_unwrap_tool_literal_text(raw_text)
+            if unwrapped is not None:
+                result.chain = [Comp.Plain(unwrapped)]
+
+        # 同回合文本去重（含 send_message_to_user 后复述抑制）
+        if self._dedupe_plain_result(event, result):
+            event.clear_result()
+            return
 
         if result.result_content_type == ResultContentType.STREAMING_RESULT:
             if result.async_stream is None:

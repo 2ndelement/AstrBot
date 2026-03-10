@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import os
 import uuid
@@ -368,6 +369,31 @@ class SendMessageToUserTool(FunctionTool[AstrAgentContext]):
             target_session,
             MessageChain(chain=components),
         )
+
+        # mark proactive plain text sent in this turn, so respond stage / run_agent can suppress duplicate paraphrase
+        try:
+            plain_texts: list[str] = []
+            for comp in components:
+                if isinstance(comp, Comp.Plain) and comp.text and comp.text.strip():
+                    plain_texts.append(comp.text.strip())
+            if plain_texts:
+                merged_plain_text = "\n".join(plain_texts)
+                context.context.event.set_extra(
+                    "_send_message_to_user_last_plain_text", merged_plain_text
+                )
+                context.context.event.set_extra(
+                    "_send_message_to_user_last_plain_hash",
+                    hashlib.sha256(merged_plain_text.encode("utf-8")).hexdigest(),
+                )
+
+            sent_count = int(
+                context.context.event.get_extra("_send_message_to_user_sent_count", 0) or 0
+            )
+            context.context.event.set_extra(
+                "_send_message_to_user_sent_count", sent_count + 1
+            )
+        except Exception:
+            pass
 
         # if file_from_sandbox:
         #     try:

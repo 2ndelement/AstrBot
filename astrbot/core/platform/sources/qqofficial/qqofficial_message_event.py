@@ -47,6 +47,7 @@ _patch_qq_botpy_formdata()
 
 class QQOfficialMessageEvent(AstrMessageEvent):
     MARKDOWN_NOT_ALLOWED_ERROR = "不允许发送原生 markdown"
+    STREAM_MARKDOWN_NEWLINE_ERROR = "流式消息md分片需要\\n结束"
 
     def __init__(
         self,
@@ -66,6 +67,9 @@ class QQOfficialMessageEvent(AstrMessageEvent):
 
     async def send_streaming(self, generator, use_fallback: bool = False):
         """流式输出仅支持消息列表私聊（C2C），其他消息源退化为普通发送"""
+        # 先标记事件层“已执行发送操作”，避免异常路径遗漏
+        await super().send_streaming(generator, use_fallback)
+        # QQ C2C 流式协议：开始/中间分片使用 state=1，结束分片使用 state=10
         stream_payload = {"state": 1, "id": None, "index": 0, "reset": False}
         last_edit_time = 0  # 上次发送分片的时间
         throttle_interval = 1  # 分片间最短间隔 (秒)
@@ -90,8 +94,9 @@ class QQOfficialMessageEvent(AstrMessageEvent):
                     if self.send_buffer:
                         stream_payload["state"] = 10
                         ret = await self._post_send(stream=stream_payload)
-                        if ret is not None and isinstance(ret, dict) and ret.get("id") is not None:
-                            stream_payload["id"] = ret.get("id")
+                        ret_id = self._extract_response_message_id(ret)
+                        if ret_id is not None:
+                            stream_payload["id"] = ret_id
                     # 重置 stream_payload，为下一段流式做准备
                     stream_payload = {"state": 1, "id": None, "index": 0, "reset": False}
                     last_edit_time = 0
@@ -111,9 +116,11 @@ class QQOfficialMessageEvent(AstrMessageEvent):
                         await self._post_send(stream=stream_payload),
                     )
                     stream_payload["index"] += 1
-                    if ret is not None and isinstance(ret, dict) and ret.get("id") is not None:
-                        stream_payload["id"] = ret.get("id")
+                    ret_id = self._extract_response_message_id(ret)
+                    if ret_id is not None:
+                        stream_payload["id"] = ret_id
                     last_edit_time = asyncio.get_event_loop().time()
+                    self.send_buffer = None  # 清空已发送的分片，避免下次重复发送旧内容
 
             if isinstance(source, botpy.message.C2CMessage):
                 # 结束流式对话，发送 buffer 中剩余内容
@@ -124,18 +131,22 @@ class QQOfficialMessageEvent(AstrMessageEvent):
 
         except Exception as e:
             logger.error(f"发送流式消息时出错: {e}", exc_info=True)
-            # 流式发送失败时，尝试用已累积的 buffer 做非流式兜底发送
-            if self.send_buffer:
-                try:
-                    await self._post_send()
-                    logger.info("流式发送失败，已降级为非流式发送成功")
-                except Exception as e2:
-                    logger.error(f"非流式降级发送也失败: {e2}", exc_info=True)
-                    self.send_buffer = None
-            else:
-                self.send_buffer = None
+            # 避免累计内容在异常后被整包重复发送：仅清理缓存，不做非流式整包兜底
+            # 如需兜底，应该只发送未发送 delta（后续可继续优化）
+            self.send_buffer = None
 
-        return await super().send_streaming(generator, use_fallback)
+        return None
+
+    @staticmethod
+    def _extract_response_message_id(ret) -> str | None:
+        """兼容 qq-botpy 返回 Message 对象或 dict 两种形态。"""
+        if ret is None:
+            return None
+        if isinstance(ret, dict):
+            ret_id = ret.get("id")
+            return str(ret_id) if ret_id is not None else None
+        ret_id = getattr(ret, "id", None)
+        return str(ret_id) if ret_id is not None else None
 
     async def _post_send(self, stream: dict | None = None):
         if not self.send_buffer:
@@ -160,6 +171,11 @@ class QQOfficialMessageEvent(AstrMessageEvent):
             record_file_path,
         ) = await QQOfficialMessageEvent._parse_to_qqofficial(self.send_buffer)
 
+        # C2C 流式仅用于文本分片，富媒体时降级为普通发送，避免平台侧流式校验报错。
+        if stream and (image_base64 or record_file_path):
+            logger.debug("[QQOfficial] 检测到富媒体，降级为非流式发送。")
+            stream = None
+
         if (
             not plain_text
             and not image_base64
@@ -169,7 +185,7 @@ class QQOfficialMessageEvent(AstrMessageEvent):
             return None
 
         # QQ C2C 流式 API 说明：
-        # - 中间分片（state=0）：增量追加内容，不需要 \n
+        # - 开始/中间分片（state=1）：增量追加内容，不需要 \n（加了会导致强制换行）
         # - 最终分片（state=10）：结束流，content 必须以 \n 结尾（QQ API 要求）
         if stream and stream.get("state") == 10 and plain_text and not plain_text.endswith("\n"):
             plain_text = plain_text + "\n"
@@ -219,6 +235,7 @@ class QQOfficialMessageEvent(AstrMessageEvent):
                     ),
                     payload=payload,
                     plain_text=plain_text,
+                    stream=stream,
                 )
 
             case botpy.message.C2CMessage():
@@ -251,6 +268,7 @@ class QQOfficialMessageEvent(AstrMessageEvent):
                         ),
                         payload=payload,
                         plain_text=plain_text,
+                        stream=stream,
                     )
                 else:
                     ret = await self._send_with_markdown_fallback(
@@ -260,6 +278,7 @@ class QQOfficialMessageEvent(AstrMessageEvent):
                         ),
                         payload=payload,
                         plain_text=plain_text,
+                        stream=stream,
                     )
                 logger.debug(f"Message sent to C2C: {ret}")
 
@@ -275,6 +294,7 @@ class QQOfficialMessageEvent(AstrMessageEvent):
                     ),
                     payload=payload,
                     plain_text=plain_text,
+                    stream=stream,
                 )
 
             case botpy.message.DirectMessage():
@@ -289,6 +309,7 @@ class QQOfficialMessageEvent(AstrMessageEvent):
                     ),
                     payload=payload,
                     plain_text=plain_text,
+                    stream=stream,
                 )
 
             case _:
@@ -305,10 +326,31 @@ class QQOfficialMessageEvent(AstrMessageEvent):
         send_func,
         payload: dict,
         plain_text: str,
+        stream: dict | None = None,
     ):
         try:
             return await send_func(payload)
         except botpy.errors.ServerError as err:
+            # QQ 流式 markdown 分片校验：内容必须以换行结尾。
+            # 某些边界场景服务端仍可能判定失败，这里做一次修正重试。
+            if stream and self.STREAM_MARKDOWN_NEWLINE_ERROR in str(err):
+                retry_payload = payload.copy()
+
+                markdown_payload = retry_payload.get("markdown")
+                if isinstance(markdown_payload, dict):
+                    md_content = cast(str, markdown_payload.get("content", "") or "")
+                    if md_content and not md_content.endswith("\n"):
+                        retry_payload["markdown"] = {"content": md_content + "\n"}
+
+                content = cast(str | None, retry_payload.get("content"))
+                if content and not content.endswith("\n"):
+                    retry_payload["content"] = content + "\n"
+
+                logger.warning(
+                    "[QQOfficial] 流式 markdown 分片换行校验失败，已修正后重试一次。"
+                )
+                return await send_func(retry_payload)
+
             if (
                 self.MARKDOWN_NOT_ALLOWED_ERROR not in str(err)
                 or not payload.get("markdown")
@@ -320,10 +362,14 @@ class QQOfficialMessageEvent(AstrMessageEvent):
                 "[QQOfficial] markdown 发送被拒绝，回退到 content 模式重试。"
             )
             fallback_payload = payload.copy()
-            fallback_payload["markdown"] = None
+            fallback_payload.pop("markdown", None)
             fallback_payload["content"] = plain_text
             if fallback_payload.get("msg_type") == 2:
                 fallback_payload["msg_type"] = 0
+            if stream:
+                fallback_content = cast(str, fallback_payload.get("content") or "")
+                if fallback_content and not fallback_content.endswith("\n"):
+                    fallback_payload["content"] = fallback_content + "\n"
             return await send_func(fallback_payload)
 
     async def upload_group_and_c2c_image(
