@@ -3,10 +3,11 @@ name: Auto Sync Upstream
 on:
   workflow_dispatch:
   schedule:
-    - cron: '20 * * * *'
+    - cron: '20 8 * * *'
 
 permissions:
   contents: write
+  issues: write
 
 jobs:
   sync-upstream:
@@ -28,14 +29,50 @@ jobs:
           git fetch upstream master --tags
 
       - name: Sync master from upstream when mergeable
+        id: sync
         run: |
           git checkout master
           git fetch origin master
           git reset --hard origin/master
           if git merge --no-ff --no-edit upstream/master; then
             git push origin master
+            echo "result=merged" >> "$GITHUB_OUTPUT"
           else
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
             echo "Auto-sync stopped due to merge conflicts."
             git merge --abort || true
             exit 1
           fi
+
+      - name: Create issue on conflict
+        if: failure() && steps.sync.outputs.result == 'conflict'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const title = '[auto-sync] upstream master merge conflict';
+            const label = 'auto-sync';
+
+            const { data: labels } = await github.rest.issues.listLabelsOnRepo({ owner, repo, per_page: 100 });
+            if (!labels.find(l => l.name === label)) {
+              await github.rest.issues.createLabel({ owner, repo, name: label, color: 'd73a4a', description: 'Issues created by auto sync workflow' });
+            }
+
+            const { data: issues } = await github.rest.issues.listForRepo({ owner, repo, state: 'open', labels: label, per_page: 100 });
+            const exists = issues.find(issue => issue.title === title);
+            if (!exists) {
+              await github.rest.issues.create({
+                owner,
+                repo,
+                title,
+                labels: [label],
+                body: [
+                  'The auto-sync workflow could not merge `upstream/master` into `master` automatically.',
+                  '',
+                  `Run: ${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
+                  '',
+                  'Please resolve the merge conflict manually.'
+                ].join('\n')
+              });
+            }
