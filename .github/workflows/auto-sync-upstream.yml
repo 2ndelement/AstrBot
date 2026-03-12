@@ -1,0 +1,41 @@
+name: Auto Sync Upstream
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '20 * * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  sync-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/AstrBotDevs/AstrBot.git 2>/dev/null || true
+          git fetch upstream master --tags
+
+      - name: Sync master from upstream when mergeable
+        run: |
+          git checkout master
+          git fetch origin master
+          git reset --hard origin/master
+          if git merge --no-ff --no-edit upstream/master; then
+            git push origin master
+          else
+            echo "Auto-sync stopped due to merge conflicts."
+            git merge --abort || true
+            exit 1
+          fi
