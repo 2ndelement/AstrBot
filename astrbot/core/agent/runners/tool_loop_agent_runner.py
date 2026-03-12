@@ -279,7 +279,10 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                         candidate_id,
                     )
                     try:
-                        from astrbot.core.agent.context.truncator import ContextTruncator
+                        from astrbot.core.agent.context.truncator import (
+                            ContextTruncator,
+                        )
+
                         _truncator = ContextTruncator()
                         _before_total = len(self.run_context.messages)
                         # Aggressively halve until small enough (up to 5 rounds)
@@ -292,13 +295,17 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                             _after = len(self.run_context.messages)
                             logger.info(
                                 "Forced context truncation round %d: %d -> %d messages.",
-                                _halve_round + 1, _before, _after,
+                                _halve_round + 1,
+                                _before,
+                                _after,
                             )
                             if _after <= 4:
                                 break  # Can't shrink further
                             # Retry same candidate
                             try:
-                                async for resp in self._iter_llm_responses(include_model=idx == 0):
+                                async for resp in self._iter_llm_responses(
+                                    include_model=idx == 0
+                                ):
                                     if resp.is_chunk:
                                         has_stream_output = True
                                         yield resp
@@ -306,7 +313,9 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                                     yield resp
                                     logger.info(
                                         "Context truncation succeeded after %d round(s): %d -> %d messages.",
-                                        _halve_round + 1, _before_total, _after,
+                                        _halve_round + 1,
+                                        _before_total,
+                                        _after,
                                     )
                                     _compression_success = True
                                     return
@@ -327,13 +336,15 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                                     last_exception = retry_exc
                                     logger.warning(
                                         "Chat Model %s retry after compression failed: %s",
-                                        candidate_id, retry_exc,
+                                        candidate_id,
+                                        retry_exc,
                                     )
                                     break
                                 last_exception = retry_exc
                                 logger.warning(
                                     "Chat Model %s still token-exceeded after round %d, halving again...",
-                                    candidate_id, _halve_round + 1,
+                                    candidate_id,
+                                    _halve_round + 1,
                                 )
                                 continue
                     except Exception as compress_exc:
@@ -375,8 +386,13 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         *,
         message_text: str,
     ) -> FollowUpTicket | None:
-        """Queue a follow-up message for the next tool result."""
+        """Queue a follow-up message to be injected into the next tool result.
+
+        Returns None if the agent is already done (message arrived too late) or
+        if the message text is empty.
+        """
         if self.done():
+            logger.debug("follow_up: agent already done, message discarded.")
             return None
         text = (message_text or "").strip()
         if not text:
@@ -384,6 +400,11 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         ticket = FollowUpTicket(seq=self._follow_up_seq, text=text)
         self._follow_up_seq += 1
         self._pending_follow_ups.append(ticket)
+        logger.debug(
+            "follow_up: queued ticket seq=%d, pending=%d",
+            ticket.seq,
+            len(self._pending_follow_ups),
+        )
         return ticket
 
     def _resolve_unconsumed_follow_ups(self) -> None:
@@ -402,14 +423,16 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         for ticket in follow_ups:
             ticket.consumed = True
             ticket.resolved.set()
+
         follow_up_lines = "\n".join(
             f"{idx}. {ticket.text}" for idx, ticket in enumerate(follow_ups, start=1)
         )
+        count = len(follow_ups)
+        plural = "messages" if count > 1 else "message"
         return (
-            "\n\n[SYSTEM NOTICE] User sent follow-up messages while tool execution "
-            "was in progress. Prioritize these follow-up instructions in your next "
-            "actions. In your very next action, briefly acknowledge to the user "
-            "that their follow-up message(s) were received before continuing.\n"
+            f"\n\n[FOLLOW-UP x{count}] The user sent {count} {plural} while you were working. "
+            "Incorporate them as supplementary instructions seamlessly — "
+            "do NOT stop, restart, or explicitly acknowledge receipt; just act naturally.\n"
             f"{follow_up_lines}"
         )
 
@@ -714,7 +737,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             self.run_context.messages.append(
                 Message(
                     role="user",
-                    content="工具调用次数已达到上限，请停止使用工具，并根据已经收集到的信息，对你的任务和发现进行总结，然后直接回复用户。",
+                    content="工具调用次数已达到上限，请停止使用工具，并根据已经收集到的信息，对你的任务和发现进行总结，然后直接回复用户。(Tool call limit reached. Stop using tools and summarize your findings directly for the user.)",
                 )
             )
             # 再执行最后一步
