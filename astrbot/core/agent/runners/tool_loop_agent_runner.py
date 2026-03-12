@@ -28,7 +28,6 @@ from astrbot.core.persona_error_reply import (
 )
 from astrbot.core.provider.entities import (
     LLMResponse,
-    LLM_CONTROL_CODE_EMPTY_COMPLETION_RETRY,
     LLM_CONTROL_CODE_UNKNOWN_TOOL_CALL,
     ProviderRequest,
     ToolCallsResult,
@@ -87,10 +86,6 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         """Read persona-level custom error message from event extras when available."""
         event = getattr(self.run_context.context, "event", None)
         return extract_persona_custom_error_message_from_event(event)
-
-    @staticmethod
-    def _is_empty_completion_retry(resp: LLMResponse) -> bool:
-        return resp.control_code == LLM_CONTROL_CODE_EMPTY_COMPLETION_RETRY
 
     @staticmethod
     def _is_unknown_tool_call(resp: LLMResponse) -> bool:
@@ -257,24 +252,6 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                         yield resp
                         continue
 
-                    if self._is_empty_completion_retry(resp):
-                        # Empty/unparseable response from model, retry same provider once
-                        logger.warning(
-                            "Chat Model %s returned empty/unparseable completion, retrying once...",
-                            candidate_id,
-                        )
-                        try:
-                            async for retry_resp in self._iter_llm_responses(include_model=idx == 0):
-                                if retry_resp.is_chunk:
-                                    yield retry_resp
-                                    continue
-                                yield retry_resp
-                                return
-                        except Exception as retry_exc:
-                            logger.warning("Retry also failed: %s", retry_exc)
-                            last_exception = retry_exc
-                        break
-
                     if (
                         resp.role == "err"
                         and not has_stream_output
@@ -294,80 +271,6 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                     return
             except Exception as exc:  # noqa: BLE001
                 last_exception = exc
-                _exc_str = str(exc).lower()
-                # Auto-compress context when model_max_prompt_tokens_exceeded
-                if (
-                    "model_max_prompt_tokens_exceeded" in _exc_str
-                    or "prompt token count" in _exc_str
-                    or "tokens_exceeded" in _exc_str
-                    or "context_length_exceeded" in _exc_str
-                    or ("token" in _exc_str and "exceed" in _exc_str)
-                ):
-                    logger.warning(
-                        "Chat Model %s: token limit exceeded, forcing context compression and retrying...",
-                        candidate_id,
-                    )
-                    try:
-                        from astrbot.core.agent.context.truncator import ContextTruncator
-                        _truncator = ContextTruncator()
-                        _before_total = len(self.run_context.messages)
-                        # Aggressively halve until small enough (up to 5 rounds)
-                        _compression_success = False
-                        for _halve_round in range(5):
-                            _before = len(self.run_context.messages)
-                            self.run_context.messages = _truncator.truncate_by_halving(
-                                self.run_context.messages
-                            )
-                            _after = len(self.run_context.messages)
-                            logger.info(
-                                "Forced context truncation round %d: %d -> %d messages.",
-                                _halve_round + 1, _before, _after,
-                            )
-                            if _after <= 4:
-                                break  # Can't shrink further
-                            # Retry same candidate
-                            try:
-                                async for resp in self._iter_llm_responses(include_model=idx == 0):
-                                    if resp.is_chunk:
-                                        has_stream_output = True
-                                        yield resp
-                                        continue
-                                    yield resp
-                                    logger.info(
-                                        "Context truncation succeeded after %d round(s): %d -> %d messages.",
-                                        _halve_round + 1, _before_total, _after,
-                                    )
-                                    _compression_success = True
-                                    return
-                                if has_stream_output:
-                                    _compression_success = True
-                                    return
-                                _compression_success = True
-                                break  # succeeded without stream output
-                            except Exception as retry_exc:
-                                _exc_str2 = str(retry_exc).lower()
-                                if not (
-                                    "model_max_prompt_tokens_exceeded" in _exc_str2
-                                    or "prompt token count" in _exc_str2
-                                    or "tokens_exceeded" in _exc_str2
-                                    or "context_length_exceeded" in _exc_str2
-                                    or ("token" in _exc_str2 and "exceed" in _exc_str2)
-                                ):
-                                    last_exception = retry_exc
-                                    logger.warning(
-                                        "Chat Model %s retry after compression failed: %s",
-                                        candidate_id, retry_exc,
-                                    )
-                                    break
-                                last_exception = retry_exc
-                                logger.warning(
-                                    "Chat Model %s still token-exceeded after round %d, halving again...",
-                                    candidate_id, _halve_round + 1,
-                                )
-                                continue
-                    except Exception as compress_exc:
-                        logger.error("Failed to compress context: %s", compress_exc)
-                    continue
                 logger.warning(
                     "Chat Model %s request error: %s",
                     candidate_id,
@@ -404,8 +307,13 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         *,
         message_text: str,
     ) -> FollowUpTicket | None:
-        """Queue a follow-up message for the next tool result."""
+        """Queue a follow-up message to be injected into the next tool result.
+
+        Returns None if the agent is already done (message arrived too late) or
+        if the message text is empty.
+        """
         if self.done():
+            logger.debug("follow_up: agent already done, message discarded.")
             return None
         text = (message_text or "").strip()
         if not text:
@@ -413,6 +321,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         ticket = FollowUpTicket(seq=self._follow_up_seq, text=text)
         self._follow_up_seq += 1
         self._pending_follow_ups.append(ticket)
+        logger.debug("follow_up: queued ticket seq=%d, pending=%d", ticket.seq, len(self._pending_follow_ups))
         return ticket
 
     def _resolve_unconsumed_follow_ups(self) -> None:
@@ -431,15 +340,16 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         for ticket in follow_ups:
             ticket.consumed = True
             ticket.resolved.set()
+
         follow_up_lines = "\n".join(
             f"{idx}. {ticket.text}" for idx, ticket in enumerate(follow_ups, start=1)
         )
+        count = len(follow_ups)
+        plural = "messages" if count > 1 else "message"
         return (
-            "\n\n[FOLLOW-UP] The user sent additional message(s) while you were working. "
-            "Treat these as supplementary instructions for the current task — DO NOT stop "
-            "or restart the current operation. Instead, seamlessly incorporate them into "
-            "your ongoing work. Continue the task flow without interrupting it. "
-            "Do NOT acknowledge receipt explicitly; just act on them naturally.\n"
+            f"\n\n[FOLLOW-UP x{count}] The user sent {count} {plural} while you were working. "
+            "Incorporate them as supplementary instructions seamlessly — "
+            "do NOT stop, restart, or explicitly acknowledge receipt; just act naturally.\n"
             f"{follow_up_lines}"
         )
 
@@ -778,7 +688,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             self.run_context.messages.append(
                 Message(
                     role="user",
-                    content="工具调用次数已达到上限，请停止使用工具，并根据已经收集到的信息，对你的任务和发现进行总结，然后直接回复用户。",
+                    content="工具调用次数已达到上限，请停止使用工具，并根据已经收集到的信息，对你的任务和发现进行总结，然后直接回复用户。(Tool call limit reached. Stop using tools and summarize your findings directly for the user.)",
                 )
             )
             # 再执行最后一步

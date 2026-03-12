@@ -59,7 +59,7 @@ from astrbot.core.persona_error_reply import (
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
 from astrbot.core.provider import Provider
 from astrbot.core.provider.entities import ProviderRequest
-from astrbot.core.skills.skill_manager import SkillManager, build_skills_prompt
+from astrbot.core.skills.skill_manager import SkillManager, build_skills_prompt, get_skills_fingerprint
 from astrbot.core.star.context import Context
 from astrbot.core.star.star_handler import star_map
 from astrbot.core.tools.cron_tools import (
@@ -353,6 +353,33 @@ async def _ensure_persona_and_skills(
                     "You cannot use shell or Python to perform skills. "
                     "If you need to use these capabilities, ask the user to enable Computer Use in the AstrBot WebUI -> Config."
                 )
+
+    # --- Dynamic skill update detection (lightweight) ---
+    # Compute current fingerprint using only stat() calls (no file I/O).
+    # If the fingerprint changed since the last turn (stored on the event extra),
+    # inject a one-line system reminder into extra_user_content_parts so the LLM
+    # is aware that the skill list may have changed.  This avoids rebuilding the
+    # full system prompt mid-conversation (which many providers ignore anyway).
+    current_fp = get_skills_fingerprint()
+    prev_fp = event.get_extra("_skills_fp")
+    if prev_fp is not None and prev_fp != current_fp:
+        # Skills changed since the last request in this session — notify the LLM.
+        skill_names = [s.name for s in skills]
+        skills_list_str = ", ".join(skill_names) if skill_names else "(none)"
+        req.extra_user_content_parts.append(
+            TextPart(
+                text=(
+                    "<system_reminder>"
+                    "The available skill list has been updated since the last turn. "
+                    f"Current active skills: {skills_list_str}. "
+                    "Please refer to this updated list for any skill-related requests."
+                    "</system_reminder>"
+                )
+            )
+        )
+        logger.debug("Skills fingerprint changed (%s -> %s), injected update reminder.", prev_fp, current_fp)
+    event.set_extra("_skills_fp", current_fp)
+    # --- end dynamic skill update detection ---
     tmgr = plugin_context.get_llm_tool_manager()
 
     # inject toolset in the persona

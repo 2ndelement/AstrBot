@@ -464,3 +464,44 @@ class SkillManager:
 
         self.set_skill_active(skill_name, True)
         return skill_name
+
+
+# ---------------------------------------------------------------------------
+# Lightweight skill-set fingerprint for dynamic update detection
+# ---------------------------------------------------------------------------
+
+def get_skills_fingerprint(skills_root: str | None = None) -> str:
+    """Return a lightweight fingerprint of the current skill set.
+
+    Uses only os.stat() calls (no file I/O) so it is extremely cheap.
+    The fingerprint changes whenever:
+      - skills.json is modified (new skill installed / toggled)
+      - a new SKILL.md appears or disappears under skills_root
+    """
+    import hashlib
+
+    data_path = Path(get_astrbot_data_path())
+    config_path = str(data_path / SKILLS_CONFIG_FILENAME)
+    root = Path(skills_root or get_astrbot_skills_path())
+
+    parts: list[str] = []
+
+    # 1. skills.json mtime (catches installs / enable-disable)
+    try:
+        parts.append(str(os.path.getmtime(config_path)))
+    except OSError:
+        parts.append("no-config")
+
+    # 2. Count of skill dirs that have SKILL.md (catches new folders)
+    try:
+        count = sum(
+            1
+            for e in root.iterdir()
+            if e.is_dir() and (e / "SKILL.md").exists()
+        )
+        parts.append(str(count))
+    except OSError:
+        parts.append("0")
+
+    raw = "|".join(parts)
+    return hashlib.md5(raw.encode()).hexdigest()[:12]

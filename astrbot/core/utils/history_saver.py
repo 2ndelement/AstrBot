@@ -13,19 +13,39 @@ async def persist_agent_history(
     req: ProviderRequest,
     summary_note: str,
 ) -> None:
-    """Persist agent interaction into conversation history."""
+    """Persist agent interaction into conversation history.
+
+    Fix: always re-fetch the latest history from DB before appending, to
+    avoid the race-condition where a CronJob snapshot overwrites newer
+    user-bot turns that were saved while the cron was running.
+    """
     if not req or not req.conversation:
         return
 
-    history = []
+    cid = req.conversation.cid
+    umo = event.unified_msg_origin
+
+    # Re-fetch the freshest history from DB (avoids stale-snapshot overwrite)
+    history: list[dict] = []
     try:
-        history = json.loads(req.conversation.history or "[]")
+        fresh_conv = await conversation_manager.get_conversation(umo, cid)
+        if fresh_conv:
+            history = json.loads(fresh_conv.history or "[]")
+        else:
+            # Fallback: use the snapshot embedded in req (better than nothing)
+            logger.warning(
+                "persist_agent_history: could not re-fetch conversation %s, "
+                "falling back to snapshot history.",
+                cid,
+            )
+            history = json.loads(req.conversation.history or "[]")
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to parse conversation history: %s", exc)
+        logger.warning("Failed to load fresh conversation history: %s", exc)
+
     history.append({"role": "user", "content": "Output your last task result below."})
     history.append({"role": "assistant", "content": summary_note})
     await conversation_manager.update_conversation(
-        event.unified_msg_origin,
-        req.conversation.cid,
+        umo,
+        cid,
         history=history,
     )
